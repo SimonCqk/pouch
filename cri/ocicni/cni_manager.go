@@ -6,7 +6,9 @@ import (
 
 	"github.com/alibaba/pouch/cri/config"
 
+	cnicurrent "github.com/containernetworking/cni/pkg/types/current"
 	"github.com/cri-o/ocicni/pkg/ocicni"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -32,7 +34,8 @@ func NewCniManager(cfg *config.Config) (CniMgr, error) {
 		}
 	}
 
-	plugin, err := ocicni.InitCNI(networkPluginConfDir, networkPluginBinDir)
+	// If defaultNetName is empty, a network name will be automatically selected be used as the default CNI network.
+	plugin, err := ocicni.InitCNI("", networkPluginConfDir, networkPluginBinDir)
 	if err != nil {
 		return nil, err
 	}
@@ -73,11 +76,18 @@ func (c *CniManager) SetUpPodNetwork(podNetwork *ocicni.PodNetwork) error {
 
 // TearDownPodNetwork is the method called before a pod's sandbox container will be deleted.
 func (c *CniManager) TearDownPodNetwork(podNetwork *ocicni.PodNetwork) error {
+	// perform the teardown network operation whatever to
+	// give CNI Plugin a chance to perform some operations
 	err := c.plugin.TearDownPod(*podNetwork)
-	if err != nil {
-		return fmt.Errorf("failed to destroy network for sandbox %q: %v", podNetwork.ID, err)
+	if err == nil {
+		return nil
 	}
-	return nil
+
+	// if netNSPath is not found, should return the error of IsNotExist.
+	if _, err = os.Stat(podNetwork.NetNS); err != nil {
+		return err
+	}
+	return errors.Wrapf(err, "failed to destroy network for sandbox %q", podNetwork.ID)
 }
 
 // GetPodNetworkStatus is the method called to obtain the ipv4 or ipv6 addresses of the pod sandbox.
@@ -87,11 +97,26 @@ func (c *CniManager) GetPodNetworkStatus(netnsPath string) (string, error) {
 		NetNS: netnsPath,
 	}
 
-	ip, err := c.plugin.GetPodNetworkStatus(podNetwork)
+	var err error
+	results, err := c.plugin.GetPodNetworkStatus(podNetwork)
 	if err != nil {
 		return "", fmt.Errorf("failed to get pod network status: %v", err)
 	}
 
+	if len(results) == 0 {
+		return "", fmt.Errorf("failed to get pod network status for nil result")
+	}
+
+	result, ok := results[0].(*cnicurrent.Result)
+	if !ok {
+		return "", fmt.Errorf("failed to get pod network status for wrong result: %+v", results[0])
+	}
+
+	if len(result.IPs) == 0 {
+		return "", fmt.Errorf("failed to get pod network status for nil IP")
+	}
+
+	ip := result.IPs[0].Address.IP.String()
 	return ip, nil
 }
 

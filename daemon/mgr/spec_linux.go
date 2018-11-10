@@ -2,9 +2,7 @@ package mgr
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,7 +12,6 @@ import (
 	"github.com/alibaba/pouch/apis/opts"
 	"github.com/alibaba/pouch/apis/types"
 
-	"github.com/containerd/containerd/contrib/seccomp"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -81,43 +78,7 @@ func populatePlatform(ctx context.Context, c *Container, specWrapper *SpecWrappe
 		return err
 	}
 
-	// stat to setup linux namespace
-	if err := setupNamespaces(ctx, c, specWrapper); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// setupSeccomp creates seccomp security settings spec.
-func setupSeccomp(ctx context.Context, c *Container, s *specs.Spec) error {
-	if c.HostConfig.Privileged {
-		return nil
-	}
-
-	if s.Linux.Seccomp == nil {
-		s.Linux.Seccomp = &specs.LinuxSeccomp{}
-	}
-
-	// TODO: check whether seccomp is enable in your kernel, if not, cannot run a custom seccomp prifle.
-	seccompProfile := c.SeccompProfile
-	switch seccompProfile {
-	case ProfileNameUnconfined:
-		return nil
-	case ProfilePouchDefault, "":
-		s.Linux.Seccomp = seccomp.DefaultProfile(s)
-	default:
-		data, err := ioutil.ReadFile(seccompProfile)
-		if err != nil {
-			return fmt.Errorf("failed to load seccomp profile %q: %v", seccompProfile, err)
-		}
-		err = json.Unmarshal(data, s.Linux.Seccomp)
-		if err != nil {
-			return fmt.Errorf("failed to decode seccomp profile %q: %v", seccompProfile, err)
-		}
-	}
-
-	return nil
+	return setupNamespaces(ctx, c, specWrapper)
 }
 
 // setupResource creates linux resource spec.
@@ -409,21 +370,7 @@ func setupNamespaces(ctx context.Context, c *Container, specWrapper *SpecWrapper
 	}
 
 	// create uts namespace spec
-	if err := setupUtsNamespace(ctx, c, specWrapper); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// isEmpty indicates whether namespace mode is empty.
-func isEmpty(mode string) bool {
-	return mode == ""
-}
-
-// isNone indicates whether container's namespace mode is set to "none".
-func isNone(mode string) bool {
-	return mode == "none"
+	return setupUtsNamespace(ctx, c, specWrapper)
 }
 
 // isHost indicates whether the container shares the host's corresponding namespace.
@@ -431,28 +378,10 @@ func isHost(mode string) bool {
 	return mode == "host"
 }
 
-// isShareable indicates whether the containers namespace can be shared with another container.
-func isShareable(mode string) bool {
-	return mode == "shareable"
-}
-
 // isContainer indicates whether the container uses another container's corresponding namespace.
 func isContainer(mode string) bool {
 	parts := strings.SplitN(mode, ":", 2)
 	return len(parts) > 1 && parts[0] == "container"
-}
-
-// isPrivate indicates whether the container uses its own namespace.
-func isPrivate(ns specs.LinuxNamespaceType, mode string) bool {
-	switch ns {
-	case specs.IPCNamespace:
-		return mode == "private"
-	case specs.NetworkNamespace, specs.PIDNamespace:
-		return !(isHost(mode) || isContainer(mode))
-	case specs.UserNamespace, specs.UTSNamespace:
-		return !(isHost(mode))
-	}
-	return false
 }
 
 // connectedContainer is the id or name of the container whose namespace this container share with.

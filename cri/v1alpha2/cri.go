@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,17 +13,23 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/alibaba/pouch/apis/filters"
 	apitypes "github.com/alibaba/pouch/apis/types"
 	anno "github.com/alibaba/pouch/cri/annotations"
 	runtime "github.com/alibaba/pouch/cri/apis/v1alpha2"
+	"github.com/alibaba/pouch/cri/metrics"
 	cni "github.com/alibaba/pouch/cri/ocicni"
 	"github.com/alibaba/pouch/cri/stream"
+	criutils "github.com/alibaba/pouch/cri/utils"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/mgr"
+	"github.com/alibaba/pouch/hookplugins"
 	"github.com/alibaba/pouch/pkg/errtypes"
 	"github.com/alibaba/pouch/pkg/meta"
 	"github.com/alibaba/pouch/pkg/reference"
+	pkgstreams "github.com/alibaba/pouch/pkg/streams"
 	"github.com/alibaba/pouch/pkg/utils"
+	util_metrics "github.com/alibaba/pouch/pkg/utils/metrics"
 	"github.com/alibaba/pouch/version"
 
 	// NOTE: "golang.org/x/net/context" is compatible with standard "context" in golang1.7+.
@@ -62,9 +67,6 @@ const (
 	// resolvConfPath is the abs path of resolv.conf on host or container.
 	resolvConfPath = "/etc/resolv.conf"
 
-	// statsCollectPeriod is the time duration (in time.Second) we sync stats from containerd.
-	statsCollectPeriod = 10
-
 	// defaultSnapshotterName is the default Snapshotter name.
 	defaultSnapshotterName = "overlayfs"
 
@@ -73,6 +75,12 @@ const (
 
 	// networkNotReadyReason is the reason reported when network is not ready.
 	networkNotReadyReason = "NetworkPluginNotReady"
+
+	// passthruKey to specify whether a interface is passthru to qemu
+	passthruKey = "io.alibaba.pouch.vm.passthru"
+
+	// passthruIP is the IP for container
+	passthruIP = "io.alibaba.pouch.vm.passthru.ip"
 )
 
 var (
@@ -104,6 +112,7 @@ type CriManager struct {
 	ImageMgr     mgr.ImageMgr
 	VolumeMgr    mgr.VolumeMgr
 	CniMgr       cni.CniMgr
+	CriPlugin    hookplugins.CriPlugin
 
 	// StreamServer is the stream server of CRI serves container streaming request.
 	StreamServer Server
@@ -125,7 +134,7 @@ type CriManager struct {
 }
 
 // NewCriManager creates a brand new cri manager.
-func NewCriManager(config *config.Config, ctrMgr mgr.ContainerMgr, imgMgr mgr.ImageMgr, volumeMgr mgr.VolumeMgr) (CriMgr, error) {
+func NewCriManager(config *config.Config, ctrMgr mgr.ContainerMgr, imgMgr mgr.ImageMgr, volumeMgr mgr.VolumeMgr, criPlugin hookplugins.CriPlugin) (CriMgr, error) {
 	var streamServerAddress string
 	streamServerPort := config.CriConfig.StreamServerPort
 	// If stream server reuse the pouchd's port, extract the ip and port from pouchd's listening addresses.
@@ -147,6 +156,7 @@ func NewCriManager(config *config.Config, ctrMgr mgr.ContainerMgr, imgMgr mgr.Im
 		ContainerMgr:   ctrMgr,
 		ImageMgr:       imgMgr,
 		VolumeMgr:      volumeMgr,
+		CriPlugin:      criPlugin,
 		StreamServer:   streamServer,
 		SandboxBaseDir: path.Join(config.HomeDir, "sandboxes"),
 		SandboxImage:   config.CriConfig.SandboxImage,
@@ -174,11 +184,19 @@ func NewCriManager(config *config.Config, ctrMgr mgr.ContainerMgr, imgMgr mgr.Im
 	c.imageFSPath = imageFSPath(path.Join(config.HomeDir, "containerd/root"), defaultSnapshotterName)
 	logrus.Infof("Get image filesystem path %q", c.imageFSPath)
 
-	snapshotsSyncer := ctrMgr.NewSnapshotsSyncer(
-		c.SnapshotStore,
-		time.Duration(statsCollectPeriod)*time.Second,
-	)
-	snapshotsSyncer.Start()
+	if !config.CriConfig.DisableCriStatsCollect {
+		period := config.CriConfig.CriStatsCollectPeriod
+		if period <= 0 {
+			return nil, fmt.Errorf("cri stats collect period should > 0")
+		}
+		snapshotsSyncer := ctrMgr.NewSnapshotsSyncer(
+			c.SnapshotStore,
+			time.Duration(period)*time.Second,
+		)
+		snapshotsSyncer.Start()
+	} else {
+		logrus.Infof("disable cri to collect stats from containerd periodically")
+	}
 
 	return NewCriWrapper(c), nil
 }
@@ -208,6 +226,12 @@ func (c *CriManager) Version(ctx context.Context, r *runtime.VersionRequest) (*r
 // RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
 // the sandbox is in ready state.
 func (c *CriManager) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
+	label := "run"
+	metrics.PodActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.PodActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	config := r.GetConfig()
 
 	// Step 1: Prepare image for the sandbox.
@@ -232,12 +256,37 @@ func (c *CriManager) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		return nil, fmt.Errorf("failed to create a sandbox for pod %q: %v", config.Metadata.Name, err)
 	}
 	id := createResp.ID
+
+	// once sandbox container created, we are obligated to store it.
+	sandboxMeta := &SandboxMeta{
+		ID:      id,
+		Config:  config,
+		Runtime: config.Annotations[anno.KubernetesRuntime],
+	}
+
+	if _, ok := config.Annotations[anno.LxcfsEnabled]; ok {
+		enableLxcfs, err := strconv.ParseBool(config.Annotations[anno.LxcfsEnabled])
+		if err != nil {
+			return nil, err
+		}
+		sandboxMeta.LxcfsEnabled = enableLxcfs
+	}
+
+	if err := c.SandboxStore.Put(sandboxMeta); err != nil {
+		return nil, err
+	}
+
+	// If running sandbox failed, clean up the container.
 	defer func() {
-		// If running sandbox failed, clean up the container.
 		if retErr != nil {
-			err := c.ContainerMgr.Remove(ctx, id, &apitypes.ContainerRemoveOptions{Volumes: true, Force: true})
-			if err != nil {
-				logrus.Errorf("failed to remove the container when running sandbox failed: %v", err)
+			if err := c.ContainerMgr.Remove(ctx, id, &apitypes.ContainerRemoveOptions{Volumes: true, Force: true}); err != nil {
+				logrus.Errorf("failed to remove container when running sandbox failed %q: %v", id, err)
+				return
+			}
+			// should not remove the sandbox container metadata from sandboxStore
+			// until it was removed by pouchd.
+			if err := c.SandboxStore.Remove(id); err != nil {
+				logrus.Errorf("failed to remove the metadata of container %q from sandboxStore: %v", id, err)
 			}
 		}
 	}()
@@ -256,7 +305,10 @@ func (c *CriManager) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	defer func() {
 		// If running sandbox failed, clean up the sandbox directory.
 		if retErr != nil {
-			os.RemoveAll(sandboxRootDir)
+
+			if err := os.RemoveAll(sandboxRootDir); err != nil {
+				logrus.Errorf("failed to clean up the directory of sandbox %q: %v", id, err)
+			}
 		}
 	}()
 
@@ -267,49 +319,16 @@ func (c *CriManager) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	}
 
 	// Step 4: Setup networking for the sandbox.
-	var netnsPath string
 	networkNamespaceMode := config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork()
 	// If it is in host network, no need to configure the network of sandbox.
 	if networkNamespaceMode != runtime.NamespaceMode_NODE {
-		netnsPath, err = c.setupPodNetwork(ctx, id, config)
+		err = c.setupPodNetwork(ctx, id, config)
 		if err != nil {
 			return nil, err
 		}
-		defer func() {
-			// Teardown network if an error is returned.
-			if retErr != nil {
-				teardownNetErr := c.CniMgr.TearDownPodNetwork(&ocicni.PodNetwork{
-					Name:         config.GetMetadata().GetName(),
-					Namespace:    config.GetMetadata().GetNamespace(),
-					ID:           id,
-					NetNS:        netnsPath,
-					PortMappings: toCNIPortMappings(config.GetPortMappings()),
-				})
-				if teardownNetErr != nil {
-					logrus.Errorf("failed to destroy network for sandbox %q: %v", id, teardownNetErr)
-				}
-			}
-		}()
 	}
 
-	sandboxMeta := &SandboxMeta{
-		ID:        id,
-		Config:    config,
-		NetNSPath: netnsPath,
-		Runtime:   config.Annotations[anno.KubernetesRuntime],
-	}
-
-	if _, ok := config.Annotations[anno.LxcfsEnabled]; ok {
-		enableLxcfs, err := strconv.ParseBool(config.Annotations[anno.LxcfsEnabled])
-		if err != nil {
-			return nil, err
-		}
-		sandboxMeta.LxcfsEnabled = enableLxcfs
-	}
-
-	if err := c.SandboxStore.Put(sandboxMeta); err != nil {
-		return nil, err
-	}
+	metrics.PodSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
@@ -318,6 +337,12 @@ func (c *CriManager) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 // and we should reconfigure it with network plugin which will make sure it reacquire its original network configuration,
 // like IP address.
 func (c *CriManager) StartPodSandbox(ctx context.Context, r *runtime.StartPodSandboxRequest) (*runtime.StartPodSandboxResponse, error) {
+	label := "start"
+	metrics.PodActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.PodActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	podSandboxID := r.GetPodSandboxId()
 
 	// start PodSandbox.
@@ -344,37 +369,16 @@ func (c *CriManager) StartPodSandbox(ctx context.Context, r *runtime.StartPodSan
 	sandboxMeta := res.(*SandboxMeta)
 
 	// setup networking for the sandbox.
-	var netnsPath string
 	networkNamespaceMode := sandboxMeta.Config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork()
 	// If it is in host network, no need to configure the network of sandbox.
 	if networkNamespaceMode != runtime.NamespaceMode_NODE {
-		netnsPath, err = c.setupPodNetwork(ctx, podSandboxID, sandboxMeta.Config)
+		err = c.setupPodNetwork(ctx, podSandboxID, sandboxMeta.Config)
 		if err != nil {
 			return nil, err
 		}
-		defer func() {
-			// Teardown network if an error is returned.
-			if err != nil {
-				teardownNetErr := c.CniMgr.TearDownPodNetwork(&ocicni.PodNetwork{
-					Name:         sandboxMeta.Config.GetMetadata().GetName(),
-					Namespace:    sandboxMeta.Config.GetMetadata().GetNamespace(),
-					ID:           podSandboxID,
-					NetNS:        netnsPath,
-					PortMappings: toCNIPortMappings(sandboxMeta.Config.GetPortMappings()),
-				})
-				if teardownNetErr != nil {
-					logrus.Errorf("failed to destroy network for sandbox %q: %v", podSandboxID, teardownNetErr)
-				}
-			}
-		}()
 	}
 
-	// update sandboxMeta
-	sandboxMeta.NetNSPath = netnsPath
-	err = c.SandboxStore.Put(sandboxMeta)
-	if err != nil {
-		return nil, err
-	}
+	metrics.PodSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	return &runtime.StartPodSandboxResponse{}, nil
 }
@@ -382,6 +386,12 @@ func (c *CriManager) StartPodSandbox(ctx context.Context, r *runtime.StartPodSan
 // StopPodSandbox stops the sandbox. If there are any running containers in the
 // sandbox, they should be forcibly terminated.
 func (c *CriManager) StopPodSandbox(ctx context.Context, r *runtime.StopPodSandboxRequest) (*runtime.StopPodSandboxResponse, error) {
+	label := "stop"
+	metrics.PodActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.PodActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	podSandboxID := r.GetPodSandboxId()
 	res, err := c.SandboxStore.Get(podSandboxID)
 	if err != nil {
@@ -423,23 +433,24 @@ func (c *CriManager) StopPodSandbox(ctx context.Context, r *runtime.StopPodSandb
 
 	// Teardown network of the pod, if it is not in host network mode.
 	if !hostNet {
-		_, err = os.Stat(sandboxMeta.NetNSPath)
-		// If the sandbox has been stopped, the corresponding network namespace will not exist.
-		if err == nil {
-			err = c.CniMgr.TearDownPodNetwork(&ocicni.PodNetwork{
-				Name:         metadata.GetName(),
-				Namespace:    metadata.GetNamespace(),
-				ID:           podSandboxID,
-				NetNS:        sandboxMeta.NetNSPath,
-				PortMappings: toCNIPortMappings(sandboxMeta.Config.GetPortMappings()),
-			})
-			if err != nil {
+		sandbox, err := c.ContainerMgr.Get(ctx, podSandboxID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get sandbox %q: %v", podSandboxID, err)
+		}
+
+		netNSPath := containerNetns(sandbox)
+		err = c.CniMgr.TearDownPodNetwork(&ocicni.PodNetwork{
+			Name:         metadata.GetName(),
+			Namespace:    metadata.GetNamespace(),
+			ID:           podSandboxID,
+			NetNS:        netNSPath,
+			PortMappings: toCNIPortMappings(sandboxMeta.Config.GetPortMappings()),
+		})
+		if err != nil {
+			if !os.IsNotExist(err) {
 				return nil, err
 			}
-		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to stat network namespace file %s of sandbox %s: %v", sandboxMeta.NetNSPath, podSandboxID, err)
-		} else {
-			logrus.Warnf("failed to find network namespace file %s of sandbox %s which may have been already stopped", sandboxMeta.NetNSPath, podSandboxID)
+			logrus.Warnf("failed to find network namespace file %s of sandbox %s which may have been already stopped", netNSPath, podSandboxID)
 		}
 	}
 
@@ -449,12 +460,20 @@ func (c *CriManager) StopPodSandbox(ctx context.Context, r *runtime.StopPodSandb
 		return nil, fmt.Errorf("failed to stop sandbox %q: %v", podSandboxID, err)
 	}
 
+	metrics.PodSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.StopPodSandboxResponse{}, nil
 }
 
 // RemovePodSandbox removes the sandbox. If there are running containers in the
 // sandbox, they should be forcibly removed.
 func (c *CriManager) RemovePodSandbox(ctx context.Context, r *runtime.RemovePodSandboxRequest) (*runtime.RemovePodSandboxResponse, error) {
+	label := "remove"
+	metrics.PodActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.PodActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	podSandboxID := r.GetPodSandboxId()
 
 	opts := &mgr.ContainerListOption{All: true}
@@ -495,11 +514,19 @@ func (c *CriManager) RemovePodSandbox(ctx context.Context, r *runtime.RemovePodS
 		return nil, fmt.Errorf("failed to remove meta %q: %v", sandboxRootDir, err)
 	}
 
+	metrics.PodSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.RemovePodSandboxResponse{}, nil
 }
 
 // PodSandboxStatus returns the status of the PodSandbox.
 func (c *CriManager) PodSandboxStatus(ctx context.Context, r *runtime.PodSandboxStatusRequest) (*runtime.PodSandboxStatusResponse, error) {
+	label := "status"
+	metrics.PodActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.PodActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	podSandboxID := r.GetPodSandboxId()
 
 	res, err := c.SandboxStore.Get(podSandboxID)
@@ -537,11 +564,15 @@ func (c *CriManager) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 	var ip string
 	// No need to get ip for host network mode.
 	if !hostNet {
-		ip, err = c.CniMgr.GetPodNetworkStatus(sandboxMeta.NetNSPath)
+		ip, err = c.CniMgr.GetPodNetworkStatus(containerNetns(sandbox))
 		if err != nil {
 			// Maybe the pod has been stopped.
 			logrus.Warnf("failed to get ip of sandbox %q: %v", podSandboxID, err)
 		}
+	}
+
+	if v, exist := annotations[passthruKey]; exist && v == "true" {
+		ip = annotations[passthruIP]
 	}
 
 	status := &runtime.PodSandboxStatus{
@@ -563,11 +594,19 @@ func (c *CriManager) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 		},
 	}
 
+	metrics.PodSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.PodSandboxStatusResponse{Status: status}, nil
 }
 
 // ListPodSandbox returns a list of Sandbox.
 func (c *CriManager) ListPodSandbox(ctx context.Context, r *runtime.ListPodSandboxRequest) (*runtime.ListPodSandboxResponse, error) {
+	label := "list"
+	metrics.PodActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.PodActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	opts := &mgr.ContainerListOption{All: true}
 	filter := func(c *mgr.Container) bool {
 		return c.Config.Labels[containerTypeLabelKey] == containerTypeLabelSandbox
@@ -597,14 +636,35 @@ func (c *CriManager) ListPodSandbox(ctx context.Context, r *runtime.ListPodSandb
 
 	result := filterCRISandboxes(sandboxes, r.GetFilter())
 
+	metrics.PodSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ListPodSandboxResponse{Items: result}, nil
 }
 
 // CreateContainer creates a new container in the given PodSandbox.
 func (c *CriManager) CreateContainer(ctx context.Context, r *runtime.CreateContainerRequest) (*runtime.CreateContainerResponse, error) {
+	label := "create"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	config := r.GetConfig()
 	sandboxConfig := r.GetSandboxConfig()
 	podSandboxID := r.GetPodSandboxId()
+
+	// get sandbox
+	sandbox, err := c.ContainerMgr.Get(ctx, podSandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox %q: %v", podSandboxID, err)
+	}
+
+	res, err := c.SandboxStore.Get(podSandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get metadata of %q from SandboxStore: %v", podSandboxID, err)
+	}
+	sandboxMeta := res.(*SandboxMeta)
+	sandboxMeta.NetNS = containerNetns(sandbox)
 
 	labels := makeLabels(config.GetLabels(), config.GetAnnotations())
 	// Apply the container type lable.
@@ -646,7 +706,8 @@ func (c *CriManager) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		},
 		NetworkingConfig: &apitypes.NetworkingConfig{},
 	}
-	err := c.updateCreateConfig(createConfig, config, sandboxConfig, podSandboxID)
+
+	err = c.updateCreateConfig(createConfig, config, sandboxConfig, sandboxMeta)
 	if err != nil {
 		return nil, err
 	}
@@ -666,6 +727,13 @@ func (c *CriManager) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	createConfig.HostConfig.Resources.Devices = devices
 
 	containerName := makeContainerName(sandboxConfig, config)
+
+	// call cri plugin to update create config
+	if c.CriPlugin != nil {
+		if err := c.CriPlugin.PreCreateContainer(createConfig, sandboxMeta); err != nil {
+			return nil, err
+		}
+	}
 
 	createResp, err := c.ContainerMgr.Create(ctx, containerName, createConfig)
 	if err != nil {
@@ -687,19 +755,24 @@ func (c *CriManager) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	// Get container log.
 	if config.GetLogPath() != "" {
 		logPath := filepath.Join(sandboxConfig.GetLogDirectory(), config.GetLogPath())
-		// NOTE: If we attach log here, the IO of container will be created
-		// by this function first, so we should decide whether open the stdin
-		// here. It's weird actually, make it more elegant in the future.
-		err = c.attachLog(logPath, containerID, config.Stdin)
-		if err != nil {
+		if err := c.ContainerMgr.AttachCRILog(ctx, containerID, logPath); err != nil {
 			return nil, err
 		}
 	}
+
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.CreateContainerResponse{ContainerId: containerID}, nil
 }
 
 // StartContainer starts the container.
 func (c *CriManager) StartContainer(ctx context.Context, r *runtime.StartContainerRequest) (*runtime.StartContainerResponse, error) {
+	label := "start"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	containerID := r.GetContainerId()
 
 	err := c.ContainerMgr.Start(ctx, containerID, &apitypes.ContainerStartOptions{})
@@ -707,11 +780,19 @@ func (c *CriManager) StartContainer(ctx context.Context, r *runtime.StartContain
 		return nil, fmt.Errorf("failed to start container %q: %v", containerID, err)
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.StartContainerResponse{}, nil
 }
 
 // StopContainer stops a running container with a grace period (i.e., timeout).
 func (c *CriManager) StopContainer(ctx context.Context, r *runtime.StopContainerRequest) (*runtime.StopContainerResponse, error) {
+	label := "stop"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	containerID := r.GetContainerId()
 
 	err := c.ContainerMgr.Stop(ctx, containerID, r.GetTimeout())
@@ -719,11 +800,19 @@ func (c *CriManager) StopContainer(ctx context.Context, r *runtime.StopContainer
 		return nil, fmt.Errorf("failed to stop container %q: %v", containerID, err)
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.StopContainerResponse{}, nil
 }
 
 // RemoveContainer removes the container.
 func (c *CriManager) RemoveContainer(ctx context.Context, r *runtime.RemoveContainerRequest) (*runtime.RemoveContainerResponse, error) {
+	label := "remove"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	containerID := r.GetContainerId()
 
 	err := c.ContainerMgr.Remove(ctx, containerID, &apitypes.ContainerRemoveOptions{Volumes: true, Force: true})
@@ -731,11 +820,19 @@ func (c *CriManager) RemoveContainer(ctx context.Context, r *runtime.RemoveConta
 		return nil, fmt.Errorf("failed to remove container %q: %v", containerID, err)
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.RemoveContainerResponse{}, nil
 }
 
 // ListContainers lists all containers matching the filter.
 func (c *CriManager) ListContainers(ctx context.Context, r *runtime.ListContainersRequest) (*runtime.ListContainersResponse, error) {
+	label := "list"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	opts := &mgr.ContainerListOption{All: true}
 	filter := func(c *mgr.Container) bool {
 		return c.Config.Labels[containerTypeLabelKey] == containerTypeLabelContainer
@@ -760,11 +857,19 @@ func (c *CriManager) ListContainers(ctx context.Context, r *runtime.ListContaine
 
 	result := filterCRIContainers(containers, r.GetFilter())
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ListContainersResponse{Containers: result}, nil
 }
 
 // ContainerStatus inspects the container and returns the status.
 func (c *CriManager) ContainerStatus(ctx context.Context, r *runtime.ContainerStatusRequest) (*runtime.ContainerStatusResponse, error) {
+	label := "status"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	id := r.GetContainerId()
 	container, err := c.ContainerMgr.Get(ctx, id)
 	if err != nil {
@@ -893,12 +998,20 @@ func (c *CriManager) ContainerStatus(ctx context.Context, r *runtime.ContainerSt
 		Envs:        parseEnvsFromPouch(container.Config.Env),
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ContainerStatusResponse{Status: status}, nil
 }
 
 // ContainerStats returns stats of the container. If the container does not
 // exist, the call returns an error.
 func (c *CriManager) ContainerStats(ctx context.Context, r *runtime.ContainerStatsRequest) (*runtime.ContainerStatsResponse, error) {
+	label := "stats"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	containerID := r.GetContainerId()
 
 	container, err := c.ContainerMgr.Get(ctx, containerID)
@@ -911,13 +1024,35 @@ func (c *CriManager) ContainerStats(ctx context.Context, r *runtime.ContainerSta
 		return nil, fmt.Errorf("failed to decode container metrics: %v", err)
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ContainerStatsResponse{Stats: cs}, nil
 }
 
 // ListContainerStats returns stats of all running containers.
 func (c *CriManager) ListContainerStats(ctx context.Context, r *runtime.ListContainerStatsRequest) (*runtime.ListContainerStatsResponse, error) {
+	label := "stats_list"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	opts := &mgr.ContainerListOption{All: true}
 	filter := func(c *mgr.Container) bool {
+		if c.Config.Labels[containerTypeLabelKey] != containerTypeLabelContainer {
+			return false
+		}
+
+		if r.GetFilter().GetId() != "" && c.ID != r.GetFilter().GetId() {
+			return false
+		}
+		if r.GetFilter().GetPodSandboxId() != "" && c.Config.Labels[sandboxIDLabelKey] != r.GetFilter().GetPodSandboxId() {
+			return false
+		}
+		if r.GetFilter().GetLabelSelector() != nil &&
+			!criutils.MatchLabelSelector(r.GetFilter().GetLabelSelector(), c.Config.Labels) {
+			return false
+		}
 		return true
 	}
 	opts.FilterFunc = filter
@@ -938,11 +1073,19 @@ func (c *CriManager) ListContainerStats(ctx context.Context, r *runtime.ListCont
 		result.Stats = append(result.Stats, cs)
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return result, nil
 }
 
 // UpdateContainerResources updates ContainerConfig of the container.
 func (c *CriManager) UpdateContainerResources(ctx context.Context, r *runtime.UpdateContainerResourcesRequest) (*runtime.UpdateContainerResourcesResponse, error) {
+	label := "update"
+	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	containerID := r.GetContainerId()
 	container, err := c.ContainerMgr.Get(ctx, containerID)
 	if err != nil {
@@ -963,6 +1106,8 @@ func (c *CriManager) UpdateContainerResources(ctx context.Context, r *runtime.Up
 	if err != nil {
 		return nil, fmt.Errorf("failed to update resource for container %q: %v", containerID, err)
 	}
+
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	return &runtime.UpdateContainerResourcesResponse{}, nil
 }
@@ -998,53 +1143,27 @@ func (c *CriManager) ExecSync(ctx context.Context, r *runtime.ExecSyncRequest) (
 		return nil, fmt.Errorf("failed to create exec for container %q: %v", id, err)
 	}
 
-	reader, writer := io.Pipe()
-	defer writer.Close()
-
-	attachConfig := &mgr.AttachConfig{
-		Stdout:      true,
-		Stderr:      true,
-		Pipe:        writer,
-		MuxDisabled: true,
+	stdoutBuf, stderrBuf := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+	attachCfg := &pkgstreams.AttachConfig{
+		UseStdout: true,
+		Stdout:    stdoutBuf,
+		UseStderr: true,
+		Stderr:    stderrBuf,
 	}
-
-	err = c.ContainerMgr.StartExec(ctx, execid, attachConfig)
-	if err != nil {
+	if err := c.ContainerMgr.StartExec(ctx, execid, attachCfg); err != nil {
 		return nil, fmt.Errorf("failed to start exec for container %q: %v", id, err)
 	}
 
-	readWaitCh := make(chan error, 1)
-	var recv bytes.Buffer
-	go func() {
-		defer reader.Close()
-		_, err = io.Copy(&recv, reader)
-		readWaitCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		//TODO maybe stop the execution?
-		return nil, fmt.Errorf("timeout %v exceeded", timeout)
-	case readWaitErr := <-readWaitCh:
-		if readWaitErr != nil {
-			return nil, fmt.Errorf("failed to read data from the pipe: %v", err)
-		}
-		execConfig, err := c.ContainerMgr.GetExecConfig(ctx, execid)
-		if err != nil {
-			return nil, fmt.Errorf("failed to inspect exec for container %q: %v", id, err)
-		}
-
-		var stderr []byte
-		if execConfig.Error != nil {
-			stderr = []byte(execConfig.Error.Error())
-		}
-
-		return &runtime.ExecSyncResponse{
-			Stdout:   recv.Bytes(),
-			Stderr:   stderr,
-			ExitCode: int32(execConfig.ExitCode),
-		}, nil
+	execConfig, err := c.ContainerMgr.GetExecConfig(ctx, execid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect exec for container %q: %v", id, err)
 	}
+
+	return &runtime.ExecSyncResponse{
+		Stdout:   stdoutBuf.Bytes(),
+		Stderr:   stderrBuf.Bytes(),
+		ExitCode: int32(execConfig.ExitCode),
+	}, nil
 }
 
 // Exec prepares a streaming endpoint to execute a command in the container, and returns the address.
@@ -1069,6 +1188,13 @@ func (c *CriManager) UpdateRuntimeConfig(ctx context.Context, r *runtime.UpdateR
 
 // Status returns the status of the runtime.
 func (c *CriManager) Status(ctx context.Context, r *runtime.StatusRequest) (*runtime.StatusResponse, error) {
+	label := "status"
+	metrics.RuntimeActionsCounter.WithLabelValues(label).Inc()
+	// record the time spent during image pull procedure.
+	defer func(start time.Time) {
+		metrics.RuntimeActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	runtimeCondition := &runtime.RuntimeCondition{
 		Type:   runtime.RuntimeReady,
 		Status: true,
@@ -1103,13 +1229,22 @@ func (c *CriManager) Status(ctx context.Context, r *runtime.StatusRequest) (*run
 		// TODO return more info
 	}
 
+	metrics.RuntimeSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return resp, nil
 }
 
 // ListImages lists existing images.
 func (c *CriManager) ListImages(ctx context.Context, r *runtime.ListImagesRequest) (*runtime.ListImagesResponse, error) {
+	label := "list"
+	metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+	// record the time spent during image pull procedure.
+	defer func(start time.Time) {
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	// TODO: handle image list filters.
-	imageList, err := c.ImageMgr.ListImages(ctx, "")
+	imageList, err := c.ImageMgr.ListImages(ctx, filters.NewArgs())
 	if err != nil {
 		return nil, err
 	}
@@ -1137,12 +1272,20 @@ func (c *CriManager) ListImages(ctx context.Context, r *runtime.ListImagesReques
 		idExist[i.ID] = true
 	}
 
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ListImagesResponse{Images: images}, nil
 }
 
 // ImageStatus returns the status of the image. If the image is not present,
 // returns a response with ImageStatusResponse.Image set to nil.
 func (c *CriManager) ImageStatus(ctx context.Context, r *runtime.ImageStatusRequest) (*runtime.ImageStatusResponse, error) {
+	label := "status"
+	metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	imageRef := r.GetImage().GetImage()
 	ref, err := reference.Parse(imageRef)
 	if err != nil {
@@ -1162,6 +1305,8 @@ func (c *CriManager) ImageStatus(ctx context.Context, r *runtime.ImageStatusRequ
 		return nil, err
 	}
 
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ImageStatusResponse{Image: image}, nil
 }
 
@@ -1169,6 +1314,14 @@ func (c *CriManager) ImageStatus(ctx context.Context, r *runtime.ImageStatusRequ
 func (c *CriManager) PullImage(ctx context.Context, r *runtime.PullImageRequest) (*runtime.PullImageResponse, error) {
 	// TODO: authentication.
 	imageRef := r.GetImage().GetImage()
+
+	label := "pull"
+	metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+	// record the time spent during image pull procedure.
+	defer func(start time.Time) {
+		metrics.ImagePullSummary.WithLabelValues(imageRef).Observe(util_metrics.SinceInMicroseconds(start))
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
 
 	authConfig := &apitypes.AuthConfig{}
 	if r.Auth != nil {
@@ -1189,11 +1342,19 @@ func (c *CriManager) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 		return nil, err
 	}
 
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.PullImageResponse{ImageRef: imageInfo.ID}, nil
 }
 
 // RemoveImage removes the image.
 func (c *CriManager) RemoveImage(ctx context.Context, r *runtime.RemoveImageRequest) (*runtime.RemoveImageResponse, error) {
+	label := "remove"
+	metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	imageRef := r.GetImage().GetImage()
 
 	if err := c.ImageMgr.RemoveImage(ctx, imageRef, false); err != nil {
@@ -1203,11 +1364,20 @@ func (c *CriManager) RemoveImage(ctx context.Context, r *runtime.RemoveImageRequ
 		}
 		return nil, err
 	}
+
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.RemoveImageResponse{}, nil
 }
 
 // ImageFsInfo returns information of the filesystem that is used to store images.
 func (c *CriManager) ImageFsInfo(ctx context.Context, r *runtime.ImageFsInfoRequest) (*runtime.ImageFsInfoResponse, error) {
+	label := "info"
+	metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	snapshots := c.SnapshotStore.List()
 	timestamp := time.Now().UnixNano()
 	var usedBytes, inodesUsed uint64
@@ -1219,6 +1389,9 @@ func (c *CriManager) ImageFsInfo(ctx context.Context, r *runtime.ImageFsInfoRequ
 		usedBytes += sn.Size
 		inodesUsed += sn.Inodes
 	}
+
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.ImageFsInfoResponse{
 		ImageFilesystems: []*runtime.FilesystemUsage{
 			{
@@ -1233,9 +1406,18 @@ func (c *CriManager) ImageFsInfo(ctx context.Context, r *runtime.ImageFsInfoRequ
 
 // RemoveVolume removes the volume.
 func (c *CriManager) RemoveVolume(ctx context.Context, r *runtime.RemoveVolumeRequest) (*runtime.RemoveVolumeResponse, error) {
+	label := "remove"
+	metrics.VolumeActionsCounter.WithLabelValues(label).Inc()
+	defer func(start time.Time) {
+		metrics.VolumeActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	volumeName := r.GetVolumeName()
 	if err := c.VolumeMgr.Remove(ctx, volumeName); err != nil {
 		return nil, err
 	}
+
+	metrics.VolumeSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	return &runtime.RemoveVolumeResponse{}, nil
 }

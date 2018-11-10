@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/daemon/logger/jsonfile"
 	"github.com/alibaba/pouch/daemon/logger/syslog"
 	"github.com/alibaba/pouch/pkg/system"
 
@@ -56,7 +57,23 @@ func (mgr *ContainerManager) validateConfig(c *Container, update bool) ([]string
 		return warnings, err
 	}
 
-	// TODO: validate config
+	// validate seccomp, apparmor security parameters
+	sysInfo := system.NewInfo()
+	if !sysInfo.Seccomp {
+		if c.SeccompProfile != "" || c.SeccompProfile != ProfileUnconfined {
+			warnings = append(warnings, fmt.Sprintf("Current Kernel does not support seccomp, discard --security-opt seccomp=%s", c.SeccompProfile))
+		}
+		// always set SeccompProfile to unconfined if kernel not support seccomp
+		c.SeccompProfile = ProfileUnconfined
+
+	}
+	if !sysInfo.AppArmor {
+		if c.AppArmorProfile != "" {
+			warnings = append(warnings, fmt.Sprintf("Current Kernel does not support apparmor, discard --security-opt apparmor=%s", c.AppArmorProfile))
+		}
+		c.AppArmorProfile = ""
+	}
+
 	return warnings, nil
 }
 
@@ -202,7 +219,7 @@ func (mgr *ContainerManager) validateLogConfig(c *Container) error {
 
 	switch logCfg.LogDriver {
 	case types.LogConfigLogDriverNone, types.LogConfigLogDriverJSONFile:
-		return nil
+		return jsonfile.ValidateLogOpt(logCfg.LogOpts)
 	case types.LogConfigLogDriverSyslog:
 		info := mgr.convContainerToLoggerInfo(c)
 		return syslog.ValidateSyslogOption(info)
@@ -221,11 +238,7 @@ func validateNvidiaConfig(r *types.Resources) error {
 		return err
 	}
 
-	if err := validateNvidiaDevice(r); err != nil {
-		return err
-	}
-
-	return nil
+	return validateNvidiaDevice(r)
 }
 
 func validateNvidiaDriver(r *types.Resources) error {

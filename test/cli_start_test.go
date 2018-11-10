@@ -2,19 +2,18 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/test/command"
 	"github.com/alibaba/pouch/test/environment"
 
 	"github.com/go-check/check"
 	"github.com/gotestyourself/gotestyourself/icmd"
 	"github.com/kr/pty"
+	"github.com/stretchr/testify/assert"
 )
 
 // PouchStartSuite is the test suite for start CLI.
@@ -269,12 +268,9 @@ func (suite *PouchStartSuite) TestStartWithExitCode(c *check.C) {
 	ret.Assert(c, icmd.Expected{ExitCode: 101})
 
 	// test container ExitCode == 101
-	output := command.PouchRun("inspect", name).Stdout()
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].State.ExitCode, check.Equals, int64(101))
+	exitCode, err := inspectFilter(name, ".State.ExitCode")
+	c.Assert(err, check.IsNil)
+	c.Assert(exitCode, check.Equals, "101")
 }
 
 // TestStartWithUlimit starts a container with --ulimit.
@@ -324,6 +320,18 @@ func (suite *PouchStartSuite) TestStartFromCheckpoint(c *check.C) {
 	command.PouchRun("start", "--checkpoint-dir", tmpDir, "--checkpoint", checkpoint, restoredContainer).Assert(c, icmd.Success)
 }
 
+// TestStartWithTty tests running container with -tty flag and attach stdin in a non-tty client.
+func (suite *PouchStartSuite) TestStartWithTty(c *check.C) {
+	name := "TestStartWithTty"
+	res := command.PouchRun("create", "-t", "--name", name, busyboxImage, "/bin/sh", "-c", "while true;do echo hello;done")
+	defer DelContainerForceMultyTime(c, name)
+	res.Assert(c, icmd.Success)
+
+	attachRes := command.PouchRun("start", "-a", "-i", name)
+	errString := attachRes.Stderr()
+	assert.Equal(c, errString, "Error: the input device is not a TTY\n")
+}
+
 // TestStartMultiContainers tries to start more than one container.
 func (suite *PouchStartSuite) TestStartMultiContainers(c *check.C) {
 	containernames := []string{"TestStartMultiContainer-1", "TestStartMultiContainer-2"}
@@ -338,4 +346,14 @@ func (suite *PouchStartSuite) TestStartMultiContainers(c *check.C) {
 
 	res = command.PouchRun("stop", containernames[0], containernames[1])
 	res.Assert(c, icmd.Success)
+}
+
+// TestStartContainerTwice tries to start a container twice
+func (suite *PouchStartSuite) TestStartContainerTwice(c *check.C) {
+	name := "TestStartContainerTwice"
+	defer DelContainerForceMultyTime(c, name)
+
+	command.PouchRun("create", "--name", name, busyboxImage, "top").Assert(c, icmd.Success)
+	command.PouchRun("start", name).Assert(c, icmd.Success)
+	command.PouchRun("start", name).Assert(c, icmd.Success)
 }

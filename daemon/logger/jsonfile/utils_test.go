@@ -15,6 +15,8 @@ import (
 	"github.com/alibaba/pouch/pkg/utils"
 )
 
+var _ logger.LogDriver = &JSONLogFile{}
+
 func generateFileBytes(lines int) []byte {
 	buf := bytes.NewBuffer(nil)
 	defer buf.Reset()
@@ -84,16 +86,16 @@ func TestSeekOffsetByTailLines(t *testing.T) {
 }
 
 const (
-	logContentPart1 = `{"source":"stdout","line":"#1","timestamp":"2018-05-09T10:00:01Z"}
-{"source":"stdout","line":"#2","timestamp":"2018-05-09T10:00:02Z"}
-{"source":"stdout","line":"#3","timestamp":"2018-05-09T10:00:03Z"}
+	logContentPart1 = `{"stream":"stdout","log":"#1","time":"2018-05-09T10:00:01Z"}
+{"stream":"stdout","log":"#2","time":"2018-05-09T10:00:02Z"}
+{"stream":"stdout","log":"#3","time":"2018-05-09T10:00:03Z"}
 `
 
-	logContentPart2 = `{"source":"stdout","line":"#4","timestamp":"2018-05-09T10:00:04Z"}
+	logContentPart2 = `{"stream":"stdout","log":"#4","time":"2018-05-09T10:00:04Z"}
 `
 
-	logContentPart3 = `{"source":"stderr","line":"#5","timestamp":"2018-05-09T10:00:05Z"}
-{"source":"stderr","line":"#6","timestamp":"2018-05-09T10:00:06Z"}
+	logContentPart3 = `{"stream":"stderr","log":"#5","time":"2018-05-09T10:00:05Z"}
+{"stream":"stderr","log":"#6","time":"2018-05-09T10:00:06Z"}
 `
 )
 

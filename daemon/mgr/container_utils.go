@@ -50,18 +50,13 @@ func (mgr *ContainerManager) containerID(nameOrPrefix string) (string, error) {
 }
 
 func (mgr *ContainerManager) container(nameOrPrefix string) (*Container, error) {
-	res, ok := mgr.cache.Get(nameOrPrefix).Result()
-	if ok {
-		return res.(*Container), nil
-	}
-
 	id, err := mgr.containerID(nameOrPrefix)
 	if err != nil {
 		return nil, err
 	}
 
 	// lookup again
-	res, ok = mgr.cache.Get(id).Result()
+	res, ok := mgr.cache.Get(id).Result()
 	if ok {
 		return res.(*Container), nil
 	}
@@ -174,12 +169,6 @@ func parseSecurityOpts(c *Container, securityOpts []string) error {
 			c.AppArmorProfile = value
 		case "seccomp":
 			c.SeccompProfile = value
-		case "no-new-privileges":
-			noNewPrivileges, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("invalid --security-opt: %q", securityOpt)
-			}
-			c.NoNewPrivileges = noNewPrivileges
 		case "label":
 			labelOpts = append(labelOpts, value)
 		default:

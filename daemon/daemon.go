@@ -4,17 +4,18 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"plugin"
+	"path/filepath"
 	"reflect"
 
-	"github.com/alibaba/pouch/apis/plugins"
 	"github.com/alibaba/pouch/apis/server"
 	criservice "github.com/alibaba/pouch/cri"
 	"github.com/alibaba/pouch/cri/stream"
 	"github.com/alibaba/pouch/ctrd"
+	"github.com/alibaba/pouch/ctrd/supervisord"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/events"
 	"github.com/alibaba/pouch/daemon/mgr"
+	"github.com/alibaba/pouch/hookplugins"
 	"github.com/alibaba/pouch/internal"
 	"github.com/alibaba/pouch/network/mode"
 	"github.com/alibaba/pouch/pkg/meta"
@@ -22,31 +23,31 @@ import (
 
 	systemddaemon "github.com/coreos/go-systemd/daemon"
 	systemdutil "github.com/coreos/go-systemd/util"
-	"github.com/gorilla/mux"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 // Daemon refers to a daemon.
 type Daemon struct {
-	config          *config.Config
-	containerStore  *meta.Store
-	containerd      ctrd.APIClient
+	config         *config.Config
+	containerStore *meta.Store
+
+	// ctrdDaemon controls containerd process
+	ctrdDaemon *supervisord.Daemon
+
+	// ctrdClient is grpc client connecting to the containerd
+	ctrdClient      ctrd.APIClient
 	containerMgr    mgr.ContainerMgr
 	systemMgr       mgr.SystemMgr
 	imageMgr        mgr.ImageMgr
 	volumeMgr       mgr.VolumeMgr
 	networkMgr      mgr.NetworkMgr
 	server          server.Server
-	containerPlugin plugins.ContainerPlugin
-	daemonPlugin    plugins.DaemonPlugin
+	containerPlugin hookplugins.ContainerPlugin
+	daemonPlugin    hookplugins.DaemonPlugin
+	volumePlugin    hookplugins.VolumePlugin
+	criPlugin       hookplugins.CriPlugin
+	apiPlugin       hookplugins.APIPlugin
 	eventsService   *events.Events
-}
-
-// router represents the router of daemon.
-type router struct {
-	daemon *Daemon
-	*mux.Router
 }
 
 // NewDaemon constructs a brand new server.
@@ -66,18 +67,33 @@ func NewDaemon(cfg *config.Config) *Daemon {
 		return nil
 	}
 
-	// New containerd client
-	containerdBinaryFile := "containerd"
-	if cfg.ContainerdPath != "" {
-		containerdBinaryFile = cfg.ContainerdPath
+	// start containerd
+	ctrdDaemonOpts := []supervisord.Opt{
+		supervisord.WithOOMScore(cfg.OOMScoreAdjust),
+		supervisord.WithGRPCAddress(cfg.ContainerdAddr),
 	}
 
-	containerd, err := ctrd.NewClient(cfg.HomeDir,
-		ctrd.WithDebugLog(cfg.Debug),
-		ctrd.WithStartDaemon(true),
-		ctrd.WithContainerdBinary(containerdBinaryFile),
+	if cfg.ContainerdPath != "" {
+		ctrdDaemonOpts = append(ctrdDaemonOpts, supervisord.WithContainerdBinary(cfg.ContainerdPath))
+	}
+
+	if cfg.Debug {
+		ctrdDaemonOpts = append(ctrdDaemonOpts, supervisord.WithLogLevel("debug"))
+	}
+
+	ctrdDaemon, err := supervisord.Start(context.TODO(),
+		filepath.Join(cfg.HomeDir, "containerd/root"),
+		filepath.Join(cfg.HomeDir, "containerd/state"),
+		ctrdDaemonOpts...,
+	)
+	if err != nil {
+		logrus.Errorf("failed to start containerd: %v", err)
+		return nil
+	}
+
+	// create containerd client
+	ctrdClient, err := ctrd.NewClient(
 		ctrd.WithRPCAddr(cfg.ContainerdAddr),
-		ctrd.WithOOMScoreAdjust(cfg.OOMScoreAdjust),
 		ctrd.WithDefaultNamespace(cfg.DefaultNamespace),
 	)
 	if err != nil {
@@ -87,50 +103,38 @@ func NewDaemon(cfg *config.Config) *Daemon {
 
 	return &Daemon{
 		config:         cfg,
-		containerd:     containerd,
+		ctrdClient:     ctrdClient,
+		ctrdDaemon:     ctrdDaemon,
 		containerStore: containerStore,
 	}
 }
 
-func loadSymbolByName(p *plugin.Plugin, name string) (plugin.Symbol, error) {
-	s, err := p.Lookup(name)
-	if err != nil {
-		return nil, errors.Wrapf(err, "lookup plugin with name %s error", name)
-	}
-	return s, nil
-}
-
 func (d *Daemon) loadPlugin() error {
-	var s plugin.Symbol
 	var err error
 
-	if d.config.PluginPath != "" {
-		p, err := plugin.Open(d.config.PluginPath)
-		if err != nil {
-			return errors.Wrapf(err, "load plugin at %s error", d.config.PluginPath)
-		}
+	// load daemon plugin if exist
+	if daemonPlugin := hookplugins.GetDaemonPlugin(); daemonPlugin != nil {
+		d.daemonPlugin = daemonPlugin
+	}
 
-		//load container plugin if exist
-		if s, err = loadSymbolByName(p, "DaemonPlugin"); err != nil {
-			return err
-		}
-		if daemonPlugin, ok := s.(plugins.DaemonPlugin); ok {
-			logrus.Infof("setup daemon plugin from %s", d.config.PluginPath)
-			d.daemonPlugin = daemonPlugin
-		} else if s != nil {
-			return fmt.Errorf("not a container plugin at %s %q", d.config.PluginPath, s)
-		}
+	// load container plugin if exist
+	if containerPlugin := hookplugins.GetContainerPlugin(); containerPlugin != nil {
+		d.containerPlugin = containerPlugin
+	}
 
-		//load container plugin if exist
-		if s, err = loadSymbolByName(p, "ContainerPlugin"); err != nil {
-			return err
-		}
-		if containerPlugin, ok := s.(plugins.ContainerPlugin); ok {
-			logrus.Infof("setup container plugin from %s", d.config.PluginPath)
-			d.containerPlugin = containerPlugin
-		} else if s != nil {
-			return fmt.Errorf("not a container plugin at %s %q", d.config.PluginPath, s)
-		}
+	// load volume plugin if exist
+	if volumePlugin := hookplugins.GetVolumePlugin(); volumePlugin != nil {
+		d.volumePlugin = volumePlugin
+	}
+
+	// load cri plugin if exist
+	if criPlugin := hookplugins.GetCriPlugin(); criPlugin != nil {
+		d.criPlugin = criPlugin
+	}
+
+	// load api plugin if exist
+	if apiPlugin := hookplugins.GetAPIPlugin(); apiPlugin != nil {
+		d.apiPlugin = apiPlugin
 	}
 
 	if d.daemonPlugin != nil {
@@ -211,7 +215,7 @@ func (d *Daemon) Run() error {
 	criReadyCh := make(chan bool)
 	criStopCh := make(chan error)
 
-	go criservice.RunCriService(d.config, d.containerMgr, d.imageMgr, d.volumeMgr, criStreamRouterCh, criStopCh, criReadyCh)
+	go criservice.RunCriService(d.config, d.containerMgr, d.imageMgr, d.volumeMgr, d.criPlugin, criStreamRouterCh, criStopCh, criReadyCh)
 
 	streamRouter := <-criStreamRouterCh
 
@@ -224,6 +228,7 @@ func (d *Daemon) Run() error {
 		NetworkMgr:      networkMgr,
 		StreamRouter:    streamRouter,
 		ContainerPlugin: d.containerPlugin,
+		APIPlugin:       d.apiPlugin,
 	}
 
 	httpReadyCh := make(chan bool)
@@ -267,15 +272,17 @@ func (d *Daemon) Shutdown() error {
 	}
 
 	logrus.Debugf("Start cleanup containerd...")
+	if err := d.ctrdClient.Cleanup(); err != nil {
+		errMsg = fmt.Sprintf("%s\n", err.Error())
+	}
 
-	if err := d.containerd.Cleanup(); err != nil {
+	if err := d.ctrdDaemon.Stop(); err != nil {
 		errMsg = fmt.Sprintf("%s\n", err.Error())
 	}
 
 	if errMsg != "" {
 		return fmt.Errorf("failed to shutdown pouchd: %s", errMsg)
 	}
-
 	return nil
 }
 
@@ -306,7 +313,7 @@ func (d *Daemon) NetMgr() mgr.NetworkMgr {
 
 // Containerd gets containerd client.
 func (d *Daemon) Containerd() ctrd.APIClient {
-	return d.containerd
+	return d.ctrdClient
 }
 
 // MetaStore gets store of meta.
@@ -319,7 +326,7 @@ func (d *Daemon) networkInit(ctx context.Context) error {
 }
 
 // ContainerPlugin returns the container plugin fetched from shared file
-func (d *Daemon) ContainerPlugin() plugins.ContainerPlugin {
+func (d *Daemon) ContainerPlugin() hookplugins.ContainerPlugin {
 	return d.containerPlugin
 }
 

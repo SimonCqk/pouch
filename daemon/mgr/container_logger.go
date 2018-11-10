@@ -1,30 +1,31 @@
 package mgr
 
 import (
+	"path/filepath"
+
 	"github.com/alibaba/pouch/apis/types"
-	"github.com/alibaba/pouch/daemon/containerio"
 	"github.com/alibaba/pouch/daemon/logger"
+	"github.com/alibaba/pouch/daemon/logger/jsonfile"
+	"github.com/alibaba/pouch/daemon/logger/syslog"
 
 	"github.com/sirupsen/logrus"
 )
 
-func logOptionsForContainerio(c *Container) []func(*containerio.Option) {
-	optFuncs := make([]func(*containerio.Option), 0, 1)
-
+func logOptionsForContainerio(c *Container, info logger.Info) (logger.LogDriver, error) {
 	cfg := c.HostConfig.LogConfig
 	if cfg == nil || cfg.LogDriver == types.LogConfigLogDriverNone {
-		return optFuncs
+		return nil, nil
 	}
 
 	switch cfg.LogDriver {
 	case types.LogConfigLogDriverJSONFile:
-		optFuncs = append(optFuncs, containerio.WithJSONFile())
+		return jsonfile.Init(info)
 	case types.LogConfigLogDriverSyslog:
-		optFuncs = append(optFuncs, containerio.WithSyslog())
+		return syslog.Init(info)
 	default:
 		logrus.Warnf("not support (%v) log driver yet", cfg.LogDriver)
+		return nil, nil
 	}
-	return optFuncs
 }
 
 // convContainerToLoggerInfo uses logger.Info to wrap container information.
@@ -47,4 +48,19 @@ func (mgr *ContainerManager) convContainerToLoggerInfo(c *Container) logger.Info
 		ContainerRootDir: mgr.Store.Path(c.ID),
 		DaemonName:       "pouchd",
 	}
+}
+
+// SetContainerLogPath sets the log path of container.
+// LogPath would be as a field in `Inspect` response.
+func (mgr *ContainerManager) SetContainerLogPath(c *Container) {
+	if c.HostConfig.LogConfig == nil {
+		return
+	}
+
+	// If the logdriver is json-file, the LogPath should be like
+	// /var/lib/pouch/containers/5804ee42e505a5d9f30128848293fcb72d8cbc7517310bd24895e82a618fa454/json.log
+	if c.HostConfig.LogConfig.LogDriver == "json-file" {
+		c.LogPath = filepath.Join(mgr.Config.HomeDir, "containers", c.ID, "json.log")
+	}
+	return
 }

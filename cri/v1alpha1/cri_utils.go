@@ -869,25 +869,6 @@ func parseUserFromImageUser(id string) string {
 	return id
 }
 
-func (c *CriManager) attachLog(logPath string, containerID string, openStdin bool) error {
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
-	if err != nil {
-		return fmt.Errorf("failed to create container for opening log file failed: %v", err)
-	}
-	// Attach to the container to get log.
-	attachConfig := &mgr.AttachConfig{
-		Stdin:      openStdin,
-		Stdout:     true,
-		Stderr:     true,
-		CriLogFile: f,
-	}
-	err = c.ContainerMgr.Attach(context.Background(), containerID, attachConfig)
-	if err != nil {
-		return fmt.Errorf("failed to attach to container %q to get its log: %v", containerID, err)
-	}
-	return nil
-}
-
 func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Container) (*runtime.ContainerStats, error) {
 	var usedBytes, inodesUsed uint64
 
@@ -897,7 +878,7 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 	}
 
 	// snapshot key may not equals container ID later
-	sn, err := c.SnapshotStore.Get(meta.ID)
+	sn, err := c.SnapshotStore.Get(meta.SnapshotID)
 	if err == nil {
 		usedBytes = sn.Size
 		inodesUsed = sn.Inodes
@@ -909,8 +890,8 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		StorageId: &runtime.StorageIdentifier{
 			Uuid: c.ImageFSUUID,
 		},
-		UsedBytes:  &runtime.UInt64Value{usedBytes},
-		InodesUsed: &runtime.UInt64Value{inodesUsed},
+		UsedBytes:  &runtime.UInt64Value{Value: usedBytes},
+		InodesUsed: &runtime.UInt64Value{Value: inodesUsed},
 	}
 
 	labels, annotations := extractLabels(meta.Config.Labels)
@@ -936,13 +917,13 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		if metrics.CPU != nil && metrics.CPU.Usage != nil {
 			cs.Cpu = &runtime.CpuUsage{
 				Timestamp:            stats.Timestamp.UnixNano(),
-				UsageCoreNanoSeconds: &runtime.UInt64Value{metrics.CPU.Usage.Total},
+				UsageCoreNanoSeconds: &runtime.UInt64Value{Value: metrics.CPU.Usage.Total},
 			}
 		}
 		if metrics.Memory != nil && metrics.Memory.Usage != nil {
 			cs.Memory = &runtime.MemoryUsage{
 				Timestamp:       stats.Timestamp.UnixNano(),
-				WorkingSetBytes: &runtime.UInt64Value{metrics.Memory.Usage.Usage},
+				WorkingSetBytes: &runtime.UInt64Value{Value: metrics.Memory.Usage.Usage},
 			}
 		}
 	}

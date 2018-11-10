@@ -36,7 +36,7 @@ type ContainerAPIClient interface {
 	ContainerPause(ctx context.Context, name string) error
 	ContainerUnpause(ctx context.Context, name string) error
 	ContainerUpdate(ctx context.Context, name string, config *types.UpdateConfig) error
-	ContainerUpgrade(ctx context.Context, name string, config types.ContainerConfig, hostConfig *types.HostConfig) error
+	ContainerUpgrade(ctx context.Context, name string, config *types.ContainerUpgradeConfig) error
 	ContainerTop(ctx context.Context, name string, arguments []string) (types.ContainerProcessList, error)
 	ContainerLogs(ctx context.Context, name string, options types.ContainerLogsOptions) (io.ReadCloser, error)
 	ContainerResize(ctx context.Context, name, height, width string) error
@@ -44,11 +44,12 @@ type ContainerAPIClient interface {
 	ContainerCheckpointCreate(ctx context.Context, name string, options types.CheckpointCreateOptions) error
 	ContainerCheckpointList(ctx context.Context, name string, options types.CheckpointListOptions) ([]string, error)
 	ContainerCheckpointDelete(ctx context.Context, name string, options types.CheckpointDeleteOptions) error
+	ContainerCommit(ctx context.Context, name string, options types.ContainerCommitOptions) (*types.ContainerCommitResp, error)
 }
 
 // ImageAPIClient defines methods of Image client.
 type ImageAPIClient interface {
-	ImageList(ctx context.Context) ([]types.ImageInfo, error)
+	ImageList(ctx context.Context, filters filters.Args) ([]types.ImageInfo, error)
 	ImageInspect(ctx context.Context, name string) (types.ImageInfo, error)
 	ImagePull(ctx context.Context, name, tag, encodedAuth string) (io.ReadCloser, error)
 	ImageRemove(ctx context.Context, name string, force bool) error

@@ -6,23 +6,26 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/daemon/containerio"
 	"github.com/alibaba/pouch/pkg/errtypes"
+	"github.com/alibaba/pouch/pkg/ioutils"
 
 	"github.com/containerd/containerd"
 	containerdtypes "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/archive"
+	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/linux/runctypes"
 	"github.com/containerd/containerd/oci"
-	"github.com/docker/docker/pkg/stdcopy"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -55,7 +58,7 @@ func (c *Client) ContainerStats(ctx context.Context, id string) (*containerdtype
 
 // containerStats returns stats of the container.
 func (c *Client) containerStats(ctx context.Context, id string) (*containerdtypes.Metric, error) {
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return nil, errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -88,20 +91,33 @@ func (c *Client) execContainer(ctx context.Context, process *Process) error {
 		return err
 	}
 
+	closeStdinCh := make(chan struct{})
+
+	// make sure the closeStdinCh has been closed.
+	defer func() {
+		close(closeStdinCh)
+	}()
+
 	var (
-		pStdout io.Writer = process.IO.Stdout
-		pStderr io.Writer = process.IO.Stderr
+		cntrID, execID          = pack.container.ID(), process.ExecID
+		withStdin, withTerminal = process.IO.Stream().Stdin() != nil, process.P.Terminal
 	)
 
-	if !process.P.Terminal && !process.IO.MuxDisabled {
-		pStdout = stdcopy.NewStdWriter(pStdout, stdcopy.Stdout)
-		pStderr = stdcopy.NewStdWriter(pStderr, stdcopy.Stderr)
-	}
-
-	io := containerio.NewIOWithTerminal(process.IO.Stdin, pStdout, pStderr, process.P.Terminal, process.IO.Stdin != nil)
-
 	// create exec process in container
-	execProcess, err := pack.task.Exec(ctx, process.ExecID, process.P, io)
+	execProcess, err := pack.task.Exec(ctx, process.ExecID, process.P, func(_ string) (cio.IO, error) {
+		logrus.WithFields(
+			logrus.Fields{
+				"container": cntrID,
+				"process":   execID,
+			},
+		).Debugf("creating cio (withStdin=%v, withTerminal=%v)", withStdin, withTerminal)
+
+		fifoset, err := containerio.NewCioFIFOSet(execID, withStdin, withTerminal)
+		if err != nil {
+			return nil, err
+		}
+		return c.createIO(fifoset, cntrID, execID, closeStdinCh, process.IO.InitContainerIO)
+	})
 	if err != nil {
 		return errors.Wrap(err, "failed to exec process")
 	}
@@ -111,24 +127,32 @@ func (c *Client) execContainer(ctx context.Context, process *Process) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to exec process")
 	}
-	fail := make(chan error, 1)
-	defer close(fail)
+
+	errCh := make(chan error, 1)
+	defer close(errCh)
 
 	go func() {
-		status := <-exitStatus
-		msg := &Message{
-			err:      status.Error(),
-			exitCode: status.ExitCode(),
-			exitTime: status.ExitTime(),
-		}
+		var msg *Message
 
-		if err := <-fail; err != nil {
-			msg.err = err
-			// exit code should not be zero when exec get failed.
-			if msg.exitCode == 0 {
-				msg.exitCode = 126
+		if startErr := <-errCh; startErr != nil {
+			msg = &Message{
+				err:      startErr,
+				exitCode: 126,
+				exitTime: time.Now().UTC(),
 			}
 		}
+
+		// success to start which means the cmd is valid and wait
+		// for process.
+		if msg == nil {
+			status := <-exitStatus
+			msg = &Message{
+				err:      status.Error(),
+				exitCode: status.ExitCode(),
+				exitTime: status.ExitTime(),
+			}
+		}
+
 		// XXX: if exec process get run, io should be closed in this function,
 		for _, hook := range c.hooks {
 			if err := hook(process.ExecID, msg); err != nil {
@@ -145,9 +169,9 @@ func (c *Client) execContainer(ctx context.Context, process *Process) error {
 
 	// start the exec process
 	if err := execProcess.Start(ctx); err != nil {
-		fail <- err
+		errCh <- err
+		return err
 	}
-
 	return nil
 }
 
@@ -196,7 +220,7 @@ func (c *Client) ContainerPIDs(ctx context.Context, id string) ([]int, error) {
 
 // containerPIDs returns the all processes's ids inside the container.
 func (c *Client) containerPIDs(ctx context.Context, id string) ([]int, error) {
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return nil, errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -249,13 +273,13 @@ func (c *Client) RecoverContainer(ctx context.Context, id string, io *containeri
 }
 
 // recoverContainer reload the container from metadata and watch it, if program be restarted.
-func (c *Client) recoverContainer(ctx context.Context, id string, io *containerio.IO) error {
+func (c *Client) recoverContainer(ctx context.Context, id string, io *containerio.IO) (err0 error) {
 	wrapperCli, err := c.Get(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get a containerd grpc client: %v", err)
 	}
 
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -268,7 +292,9 @@ func (c *Client) recoverContainer(ctx context.Context, id string, io *containeri
 		return errors.Wrapf(err, "failed to load container(%s)", id)
 	}
 
-	task, err := lc.Task(ctx, containerio.WithAttach(io.Stdin, io.Stdout, io.Stderr))
+	task, err := lc.Task(ctx, func(fset *cio.FIFOSet) (cio.IO, error) {
+		return c.attachIO(fset, io.InitContainerIO)
+	})
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
 			return errors.Wrap(err, "failed to get task")
@@ -317,7 +343,7 @@ func (c *Client) destroyContainer(ctx context.Context, id string, timeout int64)
 
 	ctx = leases.WithLease(ctx, wrapperCli.lease.ID())
 
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return nil, errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -385,7 +411,7 @@ func (c *Client) PauseContainer(ctx context.Context, id string) error {
 
 // pauseContainer pause container.
 func (c *Client) pauseContainer(ctx context.Context, id string) error {
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -416,7 +442,7 @@ func (c *Client) UnpauseContainer(ctx context.Context, id string) error {
 
 // unpauseContainer unpauses a container.
 func (c *Client) unpauseContainer(ctx context.Context, id string) error {
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -444,7 +470,7 @@ func (c *Client) CreateContainer(ctx context.Context, container *Container, chec
 		id  = container.ID
 	)
 
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -490,10 +516,10 @@ func (c *Client) createContainer(ctx context.Context, ref, id, checkpointDir str
 		rootFSPath = container.BaseFS
 	} else { // containers created by pouch must first create snapshot
 		// check snapshot exist or not.
-		if _, err := c.GetSnapshot(ctx, id); err != nil {
+		if _, err := c.GetSnapshot(ctx, container.SnapshotID); err != nil {
 			return errors.Wrapf(err, "failed to create container %s", id)
 		}
-		options = append(options, containerd.WithSnapshot(id))
+		options = append(options, containerd.WithSnapshot(container.SnapshotID))
 	}
 
 	// specify Spec for new container
@@ -533,8 +559,6 @@ func (c *Client) createContainer(ctx context.Context, ref, id, checkpointDir str
 func (c *Client) createTask(ctx context.Context, id, checkpointDir string, container containerd.Container, cc *Container, client *containerd.Client) (p *containerPack, err0 error) {
 	var pack *containerPack
 
-	io := containerio.NewIOWithTerminal(cc.IO.Stdin, cc.IO.Stdout, cc.IO.Stderr, cc.Spec.Process.Terminal, cc.IO.Stdin != nil)
-
 	checkpoint, err := createCheckpointDescriptor(ctx, checkpointDir, client)
 	if err != nil {
 		return pack, errors.Wrapf(err, "failed to create checkpoint descriptor")
@@ -549,8 +573,24 @@ func (c *Client) createTask(ctx context.Context, id, checkpointDir string, conta
 		}
 	}()
 
+	var (
+		cntrID, execID          = id, id
+		withStdin, withTerminal = cc.IO.Stream().Stdin() != nil, cc.Spec.Process.Terminal
+		closeStdinCh            = make(chan struct{})
+	)
+
 	// create task
-	task, err := container.NewTask(ctx, io, withCheckpointOpt(checkpoint))
+	task, err := container.NewTask(ctx, func(_ string) (cio.IO, error) {
+		logrus.WithField("container", cntrID).Debugf("creating cio (withStdin=%v, withTerminal=%v)", withStdin, withTerminal)
+
+		fifoset, err := containerio.NewCioFIFOSet(execID, withStdin, withTerminal)
+		if err != nil {
+			return nil, err
+		}
+		return c.createIO(fifoset, cntrID, execID, closeStdinCh, cc.IO.InitContainerIO)
+	}, withCheckpointOpt(checkpoint))
+	close(closeStdinCh)
+
 	if err != nil {
 		return pack, errors.Wrapf(err, "failed to create task for container(%s)", id)
 	}
@@ -596,7 +636,7 @@ func (c *Client) UpdateResources(ctx context.Context, id string, resources types
 
 // updateResources updates the configurations of a container.
 func (c *Client) updateResources(ctx context.Context, id string, resources types.Resources) error {
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -626,7 +666,7 @@ func (c *Client) ResizeContainer(ctx context.Context, id string, opts types.Resi
 // resizeContainer changes the size of the TTY of the init process running
 // in the container to the given height and width.
 func (c *Client) resizeContainer(ctx context.Context, id string, opts types.ResizeOptions) error {
-	if !c.lock.Trylock(id) {
+	if !c.lock.TrylockWithRetry(ctx, id) {
 		return errtypes.ErrLockfailed
 	}
 	defer c.lock.Unlock(id)
@@ -789,4 +829,108 @@ func withCheckpointOpt(checkpoint *containerdtypes.Descriptor) containerd.NewTas
 		t.Checkpoint = checkpoint
 		return nil
 	}
+}
+
+// InitStdio allows caller to handle any initialize job.
+type InitStdio func(dio *containerio.DirectIO) (cio.IO, error)
+
+func (c *Client) createIO(fifoSet *containerio.CioFIFOSet, cntrID, procID string, closeStdinCh <-chan struct{}, initstdio InitStdio) (cio.IO, error) {
+	cdio, err := containerio.NewDirectIO(context.Background(), fifoSet)
+	if err != nil {
+		return nil, err
+	}
+
+	if cdio.Stdin != nil {
+		var (
+			errClose  error
+			stdinOnce sync.Once
+		)
+		oldStdin := cdio.Stdin
+		cdio.Stdin = ioutils.NewWriteCloserWrapper(oldStdin, func() error {
+			stdinOnce.Do(func() {
+				errClose = oldStdin.Close()
+
+				// Both the caller and container/exec process holds write side pipe
+				// for the stdin. When the caller closes the write pipe, the process doesn't
+				// exit until the caller calls the CloseIO.
+				go func() {
+					<-closeStdinCh
+					if err := c.closeStdinIO(cntrID, procID); err != nil {
+						// TODO(fuweid): for the CloseIO grpc call, the containerd doesn't
+						// return correct status code if the process doesn't exist.
+						// for the case, we should use strings.Contains to reduce warning
+						// log. it will be fixed in containerd#2747.
+						if !errdefs.IsNotFound(err) && !strings.Contains(err.Error(), "not found") {
+							logrus.WithError(err).Warnf("failed to close stdin containerd IO (container:%v, process:%v", cntrID, procID)
+						}
+					}
+				}()
+			})
+			return errClose
+		})
+	}
+
+	cntrio, err := initstdio(cdio)
+	if err != nil {
+		cdio.Cancel()
+		cdio.Close()
+		return nil, err
+	}
+	return cntrio, nil
+}
+
+func (c *Client) attachIO(fifoSet *cio.FIFOSet, initstdio InitStdio) (cio.IO, error) {
+	if fifoSet == nil {
+		return nil, fmt.Errorf("cannot attach to existing fifos")
+	}
+
+	cdio, err := containerio.NewDirectIO(context.Background(), &containerio.CioFIFOSet{
+		Config: cio.Config{
+			Terminal: fifoSet.Terminal,
+			Stdin:    fifoSet.In,
+			Stdout:   fifoSet.Out,
+			Stderr:   fifoSet.Err,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cntrio, err := initstdio(cdio)
+	if err != nil {
+		cdio.Cancel()
+		cdio.Close()
+		return nil, err
+	}
+	return cntrio, nil
+}
+
+// closeStdinIO is used to close the write side of fifo in containerd-shim.
+//
+// NOTE: we should use client to make rpc call directly. if we retrieve it from
+// watch, it might return 404 because the pack is saved into cache after Start.
+func (c *Client) closeStdinIO(containerID, processID string) error {
+	ctx := context.Background()
+	wrapperCli, err := c.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get a containerd grpc client: %v", err)
+	}
+
+	cli := wrapperCli.client
+	cntr, err := cli.LoadContainer(ctx, containerID)
+	if err != nil {
+		return err
+	}
+
+	t, err := cntr.Task(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	p, err := t.LoadProcess(ctx, processID, nil)
+	if err != nil {
+		return err
+	}
+
+	return p.CloseIO(ctx, containerd.WithStdinCloser)
 }

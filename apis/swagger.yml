@@ -16,8 +16,6 @@ info:
   description: |
     API is an HTTP API served by Pouch Engine.
 
-produces:
-        - "application/json"
 paths:
   /_ping:
     get:
@@ -109,7 +107,7 @@ paths:
       description: |
         Stream real-time events from the server.
         Report various object events of pouchd when something happens to them.
-        Containers report these events: create`, `destroy`, `die`, `oom`, `pause`, `rename`, `resize`, `restart`, `start`, `stop`, `top`, `unpause`, and `update`
+        Containers report these events: create`, `destroy`, `die`, `oom`, `pause`, `rename`, `resize`, `restart`, `start`, `stop`, `top`, `unpause`, `update` and `exec_die`
         Images report these events: `pull`, `untag`
         Volumes report these events: `create`, `destroy`
         Networks report these events: `create`, `connect`, `disconnect`, `destroy`
@@ -119,7 +117,7 @@ paths:
         200:
           description: "no error"
           schema:
-            $ref: '#definitions/EventsMessage'
+            $ref: '#/definitions/EventsMessage'
         400:
           description: "bad parameter"
           schema:
@@ -350,8 +348,6 @@ paths:
             A JSON encoded value of the filters (a `map[string][]string`) to process on the images list. Available filters:
 
             - `before`=(`<image-name>[:<tag>]`,  `<image id>` or `<image@digest>`)
-            - `dangling=true`
-            - `label=key` or `label="key=value"` of an image label
             - `reference`=(`<image-name>[:<tag>]`)
             - `since`=(`<image-name>[:<tag>]`,  `<image id>` or `<image@digest>`)
           type: "string"
@@ -518,6 +514,16 @@ paths:
           description: "Return all containers. By default, only running containers are shown"
           type: "boolean"
           default: false
+        - name: "filters"
+          in: "query"
+          description: |
+            Filters encoded as JSON string(type map[string][]string in Golang). This API will list containers match all of the filters. For example, `{"status": ["paused"]}` will only return paused containers.
+            Available filters:
+            - `id=<ID>` container ID filter, support regular expression.
+            - `name=<name>` container name filter, support regular expression.
+            - `status=<status>` container status filter, support regular expression.
+            - `label=<key>=<value>` container label filter, support equal and unequal operator. such as `label=[k=a,k!=b]`.
+          type: "string"
 
   /containers/{id}/rename:
     post:
@@ -887,18 +893,10 @@ paths:
       operationId: "ContainerCheckpointCreate"
       parameters:
         - $ref: "#/parameters/id"
-        - name: "checkpointdir"
-          in: "query"
-          description: "checkpoint directory"
-          type: "string"
-        - name: "checkpointid"
-          in: "query"
-          description: "checkpoint id"
-          type: "string"
-        - name: "exit"
-          in: "query"
-          description: "exit after checkpoint"
-          type: "bool"
+        - name: "body"
+          in: "body"
+          schema:
+            $ref: "#/definitions/CheckpointCreateOptions"
       responses:
         201:
           description: "created"
@@ -909,8 +907,6 @@ paths:
         404:
           $ref: "#/responses/404ErrorResponse"
       tags: ["Container"]
-
-  /containers/{id}/checkpoints:
     get:
       summary: "list checkpoints of a container"
       operationId: "ContainerCheckpointList"
@@ -931,19 +927,20 @@ paths:
           $ref: "#/responses/404ErrorResponse"
       tags: ["Container"]
 
-  /containers/{id}/checkpoints/{id}:
+  /containers/{id}/checkpoints/{checkpointId}:
     delete:
       summary: "delete a checkpoint of a container"
       operationId: "ContainerCheckpointDelete"
       parameters:
         - $ref: "#/parameters/id"
-        - name: "checkpointdir"
+        - name: "checkpointId"
+          in: "path"
+          description: "checkpoint id"
+          type: "string"
+          required: true
+        - name: "dir"
           in: "query"
           description: "checkpoint directory"
-          type: "string"
-        - name: "checkpointid"
-          in: "query"
-          description: "checkpoint id"
           type: "string"
       responses:
         204:
@@ -1466,6 +1463,29 @@ paths:
           schema:
             $ref: "#/definitions/NetworkDisconnect"
       tags: ["Network"]
+
+  /commit:
+    post:
+      summary: "Create an image from a container"
+      operationId: "Commit"
+      consumes: ["application/json"]
+      produces: ["application/json"]
+      responses:
+        201:
+          description: "The image was created successfully"
+          schema:
+            $ref: "#/definitions/ContainerCommitResp"
+        404:
+          $ref: "#/responses/404ErrorResponse"
+        500:
+          $ref: "#/responses/500ErrorResponse"
+      parameters:
+        - name: "ContainerCommitOptions"
+          in: "body"
+          required: true
+          description: "options of commit an image from a container"
+          schema:
+            $ref: "#/definitions/ContainerCommitOptions"
 
 definitions:
   Error:
@@ -2165,6 +2185,7 @@ definitions:
       StopTimeout:
         description: "Timeout to stop a container in seconds."
         type: "integer"
+        minimum: 0
         default: 10
       Shell:
         description: "Shell for when `RUN`, `CMD`, and `ENTRYPOINT` uses a shell."
@@ -2211,6 +2232,14 @@ definitions:
         description: "net priority."
         type: "integer"
         default: 0
+      SpecificID:
+        type: "string"
+        description: |
+          Create container with given id.
+          MinLength: 64
+          MaxLength: 64
+          The characters of given id should be in 0123456789abcdef.
+          By default, given id is unnecessary.
  
   ContainerCreateResp:
     description: "response returned by daemon when container create successfully"
@@ -2333,7 +2362,6 @@ definitions:
             items:
               type: "string"
           OomScoreAdj:
-            type: "integer"
             description: |
                 An integer value containing the score given to the container in order to tune OOM killer preferences.
                 The range is in [-1000, 1000].
@@ -2456,15 +2484,27 @@ definitions:
 
   ContainerUpgradeConfig:
     description: |
-      ContainerUpgradeConfig is used for API "POST /containers/upgrade".
-      It wraps all kinds of config used in container upgrade.
-      It can be used to encode client params in client and unmarshal request body in daemon side.
-    allOf:
-      - $ref: "#/definitions/ContainerConfig"
-      - type: "object"
-        properties:
-          HostConfig:
-            $ref: "#/definitions/HostConfig"
+      ContainerUpgradeConfig is used for API "POST /containers/{name:.*}/upgrade". when upgrade a container,
+      we must specify new image used to create a new container, and also can specify `Cmd` and `Entrypoint` for
+      new container. There is all parameters that upgrade a container, if want to change other parameters, i
+      think you should use `update` API interface.
+    required: [Image]
+    properties:
+      Image:
+        type: "string"
+        x-nullable: false
+      Cmd:
+        type: "array"
+        description: "Execution commands and args"
+        items:
+          type: "string"
+      Entrypoint:
+        description: |
+          The entrypoint for the container as a string or an array of strings.
+          If the array consists of exactly one empty string (`[""]`) then the entry point is reset to system default.
+        type: "array"
+        items:
+          type: "string"
 
   LogConfig:
     description: "The logging configuration for this container"
@@ -2492,17 +2532,13 @@ definitions:
   Resources:
     description: "A container's resources (cgroups config, ulimits, etc)"
     type: "object"
-    required: [CpuShares, Memory, CgroupParent, BlkioWeight, CpuPeriod, CpuQuota, CpuRealtimePeriod, 
-    CpuRealtimeRuntime, CpusetCpus, CpusetMems, DeviceCgroupRules, KernelMemory, MemoryReservation, 
-    MemorySwap, MemorySwappiness, NanoCpus, OomKillDisable, PidsLimit, CpuCount, CpuPercent, 
-    IOMaximumIOps, IOMaximumBandwidth, IntelRdtL3Cbm, ScheLatSwitch, MemoryWmarkRatio, MemoryExtra, 
-    MemoryForceEmptyCtl]
     properties:
       # Applicable to UNIX platforms
       CgroupParent:
         description: "Path to `cgroups` under which the container's `cgroup` is created. If the path is not absolute, the path is considered to be relative to the `cgroups` path of the init process. Cgroups are created if they do not already exist."
         type: "string"
         x-nullable: false
+        x-omitempty: false
       BlkioWeight:
         description: "Block IO weight (relative weight), need CFQ IO Scheduler enable."
         type: "integer"
@@ -2510,6 +2546,7 @@ definitions:
         x-nullable: false
         minimum: 0
         maximum: 1000
+        x-omitempty: false
       BlkioWeightDevice:
         description: |
           Block IO weight (relative device weight) in the form `[{"Path": "device_path", "Weight": weight}]`.
@@ -2544,6 +2581,7 @@ definitions:
         description: "An integer value representing this container's relative CPU weight versus other containers."
         type: "integer"
         x-nullable: false
+        x-omitempty: false
       CpuPeriod:
         description: |
           CPU CFS (Completely Fair Scheduler) period.
@@ -2553,6 +2591,7 @@ definitions:
         minimum: 1000
         maximum: 1000000
         x-nullable: false
+        x-omitempty: false
       CpuQuota:
         description: |
           CPU CFS (Completely Fair Scheduler) quota.
@@ -2561,25 +2600,30 @@ definitions:
         format: "int64"
         minimum: 1000
         x-nullable: false
+        x-omitempty: false
       CpuRealtimePeriod:
         description: "The length of a CPU real-time period in microseconds. Set to 0 to allocate no time allocated to real-time tasks."
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       CpuRealtimeRuntime:
         description: "The length of a CPU real-time runtime in microseconds. Set to 0 to allocate no time allocated to real-time tasks."
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       CpusetCpus:
         description: "CPUs in which to allow execution (e.g., `0-3`, `0,1`)"
         type: "string"
         example: "0-3"
         x-nullable: false
+        x-omitempty: false
       CpusetMems:
         description: "Memory nodes (MEMs) in which to allow execution (0-3, 0,1). Only effective on NUMA systems."
         type: "string"
         x-nullable: false
+        x-omitempty: false
       Devices:
         description: "A list of devices to add to the container."
         type: "array"
@@ -2596,42 +2640,50 @@ definitions:
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       Memory:
         description: "Memory limit in bytes."
         type: "integer"
         default: 0
         x-nullable: false
+        x-omitempty: false
       MemoryReservation:
         description: "Memory soft limit in bytes."
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       MemorySwap:
         description: "Total memory limit (memory + swap). Set as `-1` to enable unlimited swap."
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       MemorySwappiness:
         description: "Tune a container's memory swappiness behavior. Accepts an integer between 0 and 100."
         type: "integer"
         format: "int64"
         minimum: 0
         maximum: 100
+        x-omitempty: false
       NanoCpus:
         description: "CPU quota in units of 10<sup>-9</sup> CPUs."
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       OomKillDisable:
         description: "Disable OOM Killer for the container."
         type: "boolean"
         x-nullable: true
+        x-omitempty: false
       PidsLimit:
         description: |
           Tune a container's pids limit. Set -1 for unlimited. Only on Linux 4.4 does this parameter support.
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       Ulimits:
         description: |
           A list of resource limits to set in the container. For example: `{"Name": "nofile", "Soft": 1024, "Hard": 2048}`"
@@ -2646,6 +2698,7 @@ definitions:
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       CpuPercent:
         description: |
           The usable percentage of the available CPUs (Windows only).
@@ -2653,30 +2706,34 @@ definitions:
         type: "integer"
         format: "int64"
         x-nullable: false
+        x-omitempty: false
       IOMaximumIOps:
         description: "Maximum IOps for the container system drive (Windows only)"
         type: "integer"
         format: "uint64"
         x-nullable: false
+        x-omitempty: false
       IOMaximumBandwidth:
         description: "Maximum IO in bytes per second for the container system drive (Windows only)"
         type: "integer"
         format: "uint64"
         x-nullable: false
+        x-omitempty: false
       IntelRdtL3Cbm:
         description: "IntelRdtL3Cbm specifies settings for Intel RDT/CAT group that the container is placed into to limit the resources (e.g., L3 cache) the container has available."
         type: "string"
         x-nullable: false
+        x-omitempty: false
 
       # applicable to AliKenerl 4.9
       ScheLatSwitch:
         description: "ScheLatSwitch enables scheduler latency count in cpuacct"
         type: "integer"
         format: "int64"
-        x-nullable: false
         minimum: 0
         maximum: 1
         x-nullable: false
+        x-omitempty: false
       MemoryWmarkRatio:
         description: | 
           MemoryWmarkRatio is an integer value representing this container's memory low water mark percentage. 
@@ -2686,6 +2743,7 @@ definitions:
         x-nullable: true
         minimum: 0
         maximum: 100
+        x-omitempty: false
       MemoryExtra:
         description: |
           MemoryExtra is an integer value representing this container's memory high water mark percentage.
@@ -2695,6 +2753,7 @@ definitions:
         x-nullable: true
         minimum: 0
         maximum: 100
+        x-omitempty: false
       MemoryForceEmptyCtl:
         description: "MemoryForceEmptyCtl represents whether to reclaim the page cache when deleting cgroup."
         type: "integer"
@@ -2702,6 +2761,7 @@ definitions:
         x-nullable: false
         minimum: 0
         maximum: 1
+        x-omitempty: false
       NvidiaConfig:
         $ref: "#/definitions/NvidiaConfig"
 
@@ -3161,6 +3221,7 @@ definitions:
   ExecCreateConfig:
     type: "object"
     description: is a small subset of the Config struct that holds the configuration.
+    required: [Cmd]
     properties:
       User:
         type: "string"
@@ -3856,8 +3917,9 @@ definitions:
         type: "string"
         example: "127.0.0.1"
       HostPort:
-        description: "Host port number that the container's port is mapped to."
+        description: "Host port number that the container's port is mapped to. range (0,65535]"
         type: "string"
+        pattern: ^([1-9]|[1-9]\d{1,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$
         example: "4443"
 
   RestartPolicy:
@@ -4215,6 +4277,32 @@ definitions:
         type: "string"
       CheckpointName:
         type: "string"
+
+  ContainerCommitOptions:
+    description: "options of committing a container into an image"
+    type: "object"
+    properties:
+      Repository:
+        type: "string"
+        description: "repository is the image name"
+      Tag:
+        type: "string"
+        description: "tag is the image tag"
+      Comment:
+        type: "string"
+        description: "comment is external information add for the image"
+      Author:
+        type: "string"
+        description: "author is the one build the image"
+
+  ContainerCommitResp:
+    type: "object"
+    description: "response of commit container for the remote API: POST /commit"
+    properties:
+      Id:
+        type: "string"
+        description: "ID uniquely identifies an image committed by a container"
+
 
 parameters:
   id:

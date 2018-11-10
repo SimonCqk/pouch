@@ -33,10 +33,11 @@ func (suite *PouchInspectSuite) SetUpSuite(c *check.C) {
 func (suite *PouchInspectSuite) TearDownTest(c *check.C) {
 }
 
-// TestInspectFormat is to verify the format flag of inspect command.
-func (suite *PouchInspectSuite) TestInspectFormat(c *check.C) {
-	name := "inspect-format-print"
+// TestInspectCreateAndStartedFormat is to verify the format flag of inspect command.
+func (suite *PouchInspectSuite) TestInspectCreateAndStartedFormat(c *check.C) {
+	name := "TestInspectCreateAndStartedFormat"
 
+	// create a raw container
 	res := command.PouchRun("create", "-m", "30M", "--name", name, busyboxImage, "top")
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
@@ -55,6 +56,20 @@ func (suite *PouchInspectSuite) TestInspectFormat(c *check.C) {
 	// inspect Memory
 	output = command.PouchRun("inspect", "-f", "{{.HostConfig.Memory}}", name).Stdout()
 	c.Assert(output, check.Equals, fmt.Sprintf("%d\n", result[0].HostConfig.Memory))
+
+	// Inspect LogPath, LogPath should be empty before container's start
+	output = command.PouchRun("inspect", "-f", "{{.LogPath}}", name).Stdout()
+	c.Assert(strings.TrimSpace(output), check.Equals, "")
+
+	// start the created container
+	res = command.PouchRun("start", name)
+	res.Assert(c, icmd.Success)
+
+	// Inspect LogPath, LogPath should not be empty after container's start.
+	// by default, the container has log type of json-file.
+	output = command.PouchRun("inspect", "-f", "{{.LogPath}}", name).Stdout()
+	expectedLogPath := fmt.Sprintf("/var/lib/pouch/containers/%s/json.log", containerID)
+	c.Assert(strings.TrimSpace(output), check.Equals, expectedLogPath)
 }
 
 // TestInspectWrongFormat is to verify using wrong format flag of inspect command.
@@ -170,4 +185,20 @@ func (suite *PouchInspectSuite) TestContainerInspectState(c *check.C) {
 	c.Assert(strings.TrimSpace(output), check.Not(check.Equals), "0")
 	output = command.PouchRun("inspect", "-f", "{{.State.Status}}", name).Stdout()
 	c.Assert(strings.TrimSpace(output), check.Equals, "stopped")
+}
+
+func (suite *PouchInspectSuite) TestContainerInspectPorts(c *check.C) {
+	name := "TestContainerInspectPorts"
+	command.PouchRun("run", "-d", "--name", name, "-p", "8080:80", busyboxImage, "top").Assert(c, icmd.Success)
+	defer DelContainerForceMultyTime(c, name)
+
+	output := command.PouchRun("inspect", name).Stdout()
+
+	containers := make([]types.ContainerJSON, 1)
+	err := json.Unmarshal([]byte(output), &containers)
+	if err != nil || len(containers) == 0 {
+		c.Fatal("fail to format container json")
+	}
+	data, _ := json.Marshal(containers[0].NetworkSettings.Ports)
+	c.Assert(string(data), check.Equals, "{\"80/tcp\":[{\"HostPort\":\"8080\"}]}")
 }

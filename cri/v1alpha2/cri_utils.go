@@ -205,14 +205,19 @@ func applySandboxSecurityContext(lc *runtime.LinuxPodSandboxConfig, config *apit
 		sc = &runtime.LinuxContainerSecurityContext{
 			SupplementalGroups: lc.SecurityContext.SupplementalGroups,
 			RunAsUser:          lc.SecurityContext.RunAsUser,
+			RunAsGroup:         lc.SecurityContext.RunAsGroup,
 			ReadonlyRootfs:     lc.SecurityContext.ReadonlyRootfs,
 			SelinuxOptions:     lc.SecurityContext.SelinuxOptions,
 			NamespaceOptions:   lc.SecurityContext.NamespaceOptions,
 		}
 	}
 
-	modifyContainerConfig(sc, config)
-	err := modifyHostConfig(sc, hc)
+	err := modifyContainerConfig(sc, config)
+	if err != nil {
+		return err
+	}
+
+	err = modifyHostConfig(sc, hc)
 	if err != nil {
 		return err
 	}
@@ -450,28 +455,23 @@ func setupSandboxFiles(sandboxRootDir string, config *runtime.PodSandboxConfig) 
 
 // setupPodNetwork sets up the network of PodSandbox and return the netnsPath of PodSandbox
 // and do nothing when networkNamespaceMode equals runtime.NamespaceMode_NODE.
-func (c *CriManager) setupPodNetwork(ctx context.Context, id string, config *runtime.PodSandboxConfig) (string, error) {
+func (c *CriManager) setupPodNetwork(ctx context.Context, id string, config *runtime.PodSandboxConfig) error {
 	container, err := c.ContainerMgr.Get(ctx, id)
 	if err != nil {
-		return "", err
+		return err
 	}
 	netnsPath := containerNetns(container)
 	if netnsPath == "" {
-		return "", fmt.Errorf("failed to find network namespace path for sandbox %q", id)
+		return fmt.Errorf("failed to find network namespace path for sandbox %q", id)
 	}
 
-	err = c.CniMgr.SetUpPodNetwork(&ocicni.PodNetwork{
+	return c.CniMgr.SetUpPodNetwork(&ocicni.PodNetwork{
 		Name:         config.GetMetadata().GetName(),
 		Namespace:    config.GetMetadata().GetNamespace(),
 		ID:           id,
 		NetNS:        netnsPath,
 		PortMappings: toCNIPortMappings(config.GetPortMappings()),
 	})
-	if err != nil {
-		return "", err
-	}
-
-	return netnsPath, nil
 }
 
 // Container related tool functions.
@@ -673,40 +673,60 @@ func modifyHostConfig(sc *runtime.LinuxContainerSecurityContext, hostConfig *api
 }
 
 // modifyContainerConfig applies container security context config to pouch's Config.
-func modifyContainerConfig(sc *runtime.LinuxContainerSecurityContext, config *apitypes.ContainerConfig) {
+func modifyContainerConfig(sc *runtime.LinuxContainerSecurityContext, config *apitypes.ContainerConfig) error {
 	if sc == nil {
-		return
+		return nil
 	}
+
+	var userStr, groupStr string
+
 	if sc.RunAsUser != nil {
-		config.User = strconv.FormatInt(sc.GetRunAsUser().Value, 10)
+		userStr = strconv.FormatInt(sc.RunAsUser.GetValue(), 10)
 	}
 	if sc.RunAsUsername != "" {
-		config.User = sc.RunAsUsername
+		userStr = sc.RunAsUsername
 	}
+	if sc.RunAsGroup != nil {
+		groupStr = strconv.FormatInt(sc.RunAsGroup.GetValue(), 10)
+	}
+
+	if userStr == "" {
+		// run_as_group should only be specified when run_as_user or run_as_username is specified;
+		// otherwise, the runtime MUST error.
+		if groupStr != "" {
+			return fmt.Errorf("user group %q is specified without user", groupStr)
+		}
+		return nil
+	}
+	if groupStr != "" {
+		userStr = userStr + ":" + groupStr
+	}
+
+	config.User = userStr
+	return nil
 }
 
 // applyContainerSecurityContext updates pouch container options according to security context.
 func applyContainerSecurityContext(lc *runtime.LinuxContainerConfig, podSandboxID string, config *apitypes.ContainerConfig, hc *apitypes.HostConfig) error {
-	modifyContainerConfig(lc.SecurityContext, config)
-
-	err := modifyHostConfig(lc.SecurityContext, hc)
+	sc := lc.SecurityContext
+	err := modifyContainerConfig(sc, config)
 	if err != nil {
 		return err
 	}
 
-	modifyContainerNamespaceOptions(lc.SecurityContext.GetNamespaceOptions(), podSandboxID, hc)
+	err = modifyHostConfig(sc, hc)
+	if err != nil {
+		return err
+	}
+
+	modifyContainerNamespaceOptions(sc.GetNamespaceOptions(), podSandboxID, hc)
 
 	return nil
 }
 
 // Apply Linux-specific options if applicable.
-func (c *CriManager) updateCreateConfig(createConfig *apitypes.ContainerCreateConfig, config *runtime.ContainerConfig, sandboxConfig *runtime.PodSandboxConfig, podSandboxID string) error {
+func (c *CriManager) updateCreateConfig(createConfig *apitypes.ContainerCreateConfig, config *runtime.ContainerConfig, sandboxConfig *runtime.PodSandboxConfig, sandboxMeta *SandboxMeta) error {
 	// Apply runtime options.
-	res, err := c.SandboxStore.Get(podSandboxID)
-	if err != nil {
-		return fmt.Errorf("failed to get metadata of %q from SandboxStore: %v", podSandboxID, err)
-	}
-	sandboxMeta := res.(*SandboxMeta)
 	if sandboxMeta.Runtime != "" {
 		createConfig.HostConfig.Runtime = sandboxMeta.Runtime
 	}
@@ -725,7 +745,7 @@ func (c *CriManager) updateCreateConfig(createConfig *apitypes.ContainerCreateCo
 		}
 
 		// Apply security context.
-		if err := applyContainerSecurityContext(lc, podSandboxID, &createConfig.ContainerConfig, createConfig.HostConfig); err != nil {
+		if err := applyContainerSecurityContext(lc, sandboxMeta.ID, &createConfig.ContainerConfig, createConfig.HostConfig); err != nil {
 			return fmt.Errorf("failed to apply container security context for container %q: %v", config.Metadata.Name, err)
 		}
 	}
@@ -896,25 +916,6 @@ func parseUserFromImageUser(id string) string {
 	return id
 }
 
-func (c *CriManager) attachLog(logPath string, containerID string, openStdin bool) error {
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
-	if err != nil {
-		return fmt.Errorf("failed to create container for opening log file failed: %v", err)
-	}
-	// Attach to the container to get log.
-	attachConfig := &mgr.AttachConfig{
-		Stdin:      openStdin,
-		Stdout:     true,
-		Stderr:     true,
-		CriLogFile: f,
-	}
-	err = c.ContainerMgr.Attach(context.Background(), containerID, attachConfig)
-	if err != nil {
-		return fmt.Errorf("failed to attach to container %q to get its log: %v", containerID, err)
-	}
-	return nil
-}
-
 func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Container) (*runtime.ContainerStats, error) {
 	var usedBytes, inodesUsed uint64
 
@@ -923,7 +924,7 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		return nil, fmt.Errorf("failed to get metadata of container %q: %v", meta.ID, err)
 	}
 
-	sn, err := c.SnapshotStore.Get(meta.ID)
+	sn, err := c.SnapshotStore.Get(meta.SnapshotID)
 	if err == nil {
 		usedBytes = sn.Size
 		inodesUsed = sn.Inodes
@@ -935,8 +936,8 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		FsId: &runtime.FilesystemIdentifier{
 			Mountpoint: c.imageFSPath,
 		},
-		UsedBytes:  &runtime.UInt64Value{usedBytes},
-		InodesUsed: &runtime.UInt64Value{inodesUsed},
+		UsedBytes:  &runtime.UInt64Value{Value: usedBytes},
+		InodesUsed: &runtime.UInt64Value{Value: inodesUsed},
 	}
 	labels, annotations := extractLabels(meta.Config.Labels)
 
@@ -961,13 +962,13 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		if metrics.CPU != nil && metrics.CPU.Usage != nil {
 			cs.Cpu = &runtime.CpuUsage{
 				Timestamp:            stats.Timestamp.UnixNano(),
-				UsageCoreNanoSeconds: &runtime.UInt64Value{metrics.CPU.Usage.Total},
+				UsageCoreNanoSeconds: &runtime.UInt64Value{Value: metrics.CPU.Usage.Total},
 			}
 		}
 		if metrics.Memory != nil && metrics.Memory.Usage != nil {
 			cs.Memory = &runtime.MemoryUsage{
 				Timestamp:       stats.Timestamp.UnixNano(),
-				WorkingSetBytes: &runtime.UInt64Value{metrics.Memory.Usage.Usage},
+				WorkingSetBytes: &runtime.UInt64Value{Value: metrics.Memory.Usage.Usage},
 			}
 		}
 	}

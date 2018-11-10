@@ -1,5 +1,5 @@
-# This file lists all contributors having contributed to pouch.
-# For how it is generated, see `hack/generate-contributors.sh`.
+# This file lists all contributors having contributed to this project.
+# For how it is generated, see command "git log --format='%aN <%aE>' | sort -uf".
 
 Ace Tang <Ace-Tang@users.noreply.github.com>
 Ace-Tang <aceapril@126.com>
@@ -16,7 +16,7 @@ chenzhimin <1141685075@qq.com>
 Chuanyun Li <lcy041536@gmail.com>
 Cindy <176425810@qq.com>
 CodeJuan <CodeJuan@users.noreply.github.com>
-CodeJuan <xh@decbug.com>
+codejuan <xh@decbug.com>
 Coordinate36 <2484652469@qq.com>
 dbdd4us <wangtong2712@gmail.com>
 devily <86979425@qq.com>
@@ -25,6 +25,8 @@ Eileen Teng <lykosteng@gmail.com>
 Erhuan <553614753@qq.com>
 Eric Li <lcy041536@gmail.com>
 fanglin <fanglin.gu@gmail.com>
+fengzixu <hnustphoenix@gmail.com>
+flyer103 <flyer103@gmail.com>
 Frank Yang <yyb196@gmail.com>
 Frank Zhao <syzhao1988@126.com>
 frankyang <yyb196@gmail.com>
@@ -37,6 +39,7 @@ Jerome Tan <DevJerome@iCloud.com>
 jiapengcs <jiapengkang@gmail.com>
 johanzhu <zhubei@MacBook-Pro-62.local>
 Jumping Qu <jumping@users.noreply.github.com>
+Junjun Li <junjunli666@gmail.com>
 kaicizhu <kaici.zkc@alibaba-inc.com>
 knight <1004815462@qq.com>
 kun <oiooj@qq.com>
@@ -50,6 +53,7 @@ Lifubang <lifubang@acmcoder.com>
 luman.qy <luman.qy@cainiao.com>
 Mark Liu <manlge168@gmail.com>
 MarkLux <marlx6590@163.com>
+mathspanda <mathspanda826@gmail.com>
 mengjiahao <691225916@qq.com>
 Michael Wan <zirenwan@gmail.com>
 mozhuli <21621232@zju.edu.cn>
@@ -67,6 +71,7 @@ Sam Xie <xsambundy@gmail.com>
 SeaRise <846579815@qq.com>
 shaloulcy <lcy041536@gmail.com>
 shanbo.lkw <shanbo.lkw@alibaba-inc.com>
+Simon_CQK <CQK0100@gmail.com>
 skoo <marckywu@gmail.com>
 skoo87 <marckywu@gmail.com>
 soarpenguin <soarpenguin@gmail.com>
@@ -74,7 +79,9 @@ Starnop <starnop@163.com>
 steven <fhtjob@hotmail.com>
 Tao Qingyun <845767657@qq.com>
 Tardis Xu <xiaoxubeii@gmail.com>
+Tim Xu <xiaoxubeii@gmail.com>
 Tiramisu 1993 <sabergeass@gmail.com>
+Tronegacy <41256009+Tronegacy@users.noreply.github.com>
 u2takey <u2takey@gmail.com>
 unknown <1020216950@qq.com>
 upccup <yaoyunsmile@gmail.com>
@@ -122,6 +129,7 @@ Zou Rui <21751189@zju.edu.cn>
 ZouRui89 <32304680+ZouRui89@users.noreply.github.com>
 万仔仁 <wanziren@meituan.com>
 宇慕 <xingyu.chenxingyu@alibaba-inc.com>
+知谨 <zhijin.zqh@alibaba-inc.com>
 程飞 <fay.cheng.cn@gmail.com>
 谢恒忠@运维小盆友 <10927831@qq.com>
 谢烟客 <CoderInfo@163.com>

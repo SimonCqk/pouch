@@ -4,7 +4,7 @@ Print versions about Pouch CLI and Pouchd
 
 ### Synopsis
 
-Print versions about Pouch CLI and Pouchd
+Display the version information of pouch client and daemon， including GoVersion, KernelVersion, Os, Version, APIVersion, Arch, BuildTime and GitCommit.
 
 ```
 pouch version
@@ -14,13 +14,13 @@ pouch version
 
 ```
 $ pouch version
-GoVersion:       go1.9.1
+GoVersion:       go1.10.4
 KernelVersion:   3.10.0-693.11.6.el7.x86_64
 Os:              linux
-Version:         0.1.0-dev
+Version:         1.0.0
 APIVersion:      1.24
 Arch:            amd64
-BuildTime:       2017-12-18T07:48:56.348129663Z
+BuildTime:       2018-11-07T07:48:56.348129663Z
 GitCommit:
 
 ```

@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/pkg/ioutils"
 
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/sirupsen/logrus"
@@ -77,6 +78,10 @@ func (e *ExecCommand) runExec(args []string) error {
 		Env:          e.Envs,
 	}
 
+	if err := checkTty(createExecConfig.AttachStdin, createExecConfig.Tty, os.Stdin.Fd()); err != nil {
+		return err
+	}
+
 	createResp, err := apiClient.ContainerCreateExec(ctx, id, createExecConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create exec: %v", err)
@@ -141,9 +146,12 @@ func holdHijackConnection(ctx context.Context, conn net.Conn, reader *bufio.Read
 	go func() {
 		if stdin {
 			io.Copy(conn, os.Stdin)
+			// close write if receive CTRL-D
+			if cw, ok := conn.(ioutils.CloseWriter); ok {
+				cw.CloseWrite()
+			}
 		}
 
-		// TODO: close write side of conn
 		close(stdinDone)
 	}()
 

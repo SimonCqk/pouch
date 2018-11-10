@@ -135,13 +135,13 @@ To enable users other than root can run pouch command directly without `sudo`, p
 If you want the unix socket to be owned by pouch group, make sure it exists or you need to create it.
 
 ```bash
-groupadd pouch
+sudo groupadd pouch
 ```
 
 **2. start pouchd**
 
 ```bash
-service pouch restart
+sudo service pouch restart
 ```
 
 **3. add user to group**
@@ -149,7 +149,7 @@ service pouch restart
 Add user who wants to have access to the pouch group.
 
 ```bash
-gpasswd -a $user pouch
+sudo gpasswd -a $USER pouch
 ```
 
 Remind that you should relogin to make /etc/group take effect, check it by typing groups to see if your shell gets pouch group.
@@ -189,10 +189,14 @@ This guide provides step by step instructions to deploy PouchContainer on bare m
 As a developer, you may need to build and test PouchContainer binaries via source code. To build pouchd which is so-called "PouchContainer Daemon" and pouch which is so-called "PouchContainer CLI", the following build system dependencies are required:
 
 * Linux Kernel 3.10+
-* Go 1.9.0+
+* Go 1.10.4+
 * containerd: 1.0.3
 * runc: 1.0.0-rc4
 * runv: 1.0.0 (option)
+
+> NOTE: The PouchContainer is using overlayfs, which requires kernel to support multiple lowerdirs.
+On 4.x kernels, they always support multiple lowerdirs overlayfs. And RHEL and Centos 3.x kernels (> 3.10.0-693.el7.x86_64) also support it.
+Besides this, it needs filesystem to support `d_type`. If the backing filesystem is `xfs`, please reformat with `ftype=1` to enable `d_type` support.
 
 ### Prerequisites Installation
 
@@ -236,6 +240,22 @@ Makefile target named `build` will compile the pouch and pouchd binaries into cu
 ``` shell
 make build && make install
 ```
+
+#### Build Tags
+
+Pouch not use build tags by default, if you want pouchd to support additional security options, build pouchd with tags like
+
+```
+make BUILDTAGS='seccomp apparmor selinux'
+```
+
+Supported build Tags
+
+| Tags     | Description                                             |
+|----------|---------------------------------------------------------|
+| seccomp  | filter syscalls                                         |
+| apparmor | restrict program capabilities with per-program profiles |
+| selinux  | selinux process and mount label                         |
 
 ### Start PouchContainer
 
