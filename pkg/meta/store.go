@@ -260,13 +260,16 @@ func (s *Store) KeysWithPrefix(prefix string) ([]string, error) {
 	s.trieLock.Lock()
 	defer s.trieLock.Unlock()
 
-	if err := s.trie.VisitSubtree(patricia.Prefix(prefix), fn); err != nil {
-		return keys, err
-	}
-	return keys, nil
+	err := s.trie.VisitSubtree(patricia.Prefix(prefix), fn)
+	return keys, err
 }
 
 // Path returns the path with specified key.
 func (s *Store) Path(key string) string {
 	return s.backend.Path(key)
+}
+
+// Shutdown releases all resources used by the backend
+func (s *Store) Shutdown() error {
+	return s.backend.Close()
 }

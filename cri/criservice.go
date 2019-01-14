@@ -7,15 +7,15 @@ import (
 	criv1alpha1 "github.com/alibaba/pouch/cri/v1alpha1"
 	servicev1alpha1 "github.com/alibaba/pouch/cri/v1alpha1/service"
 	criv1alpha2 "github.com/alibaba/pouch/cri/v1alpha2"
-	servicev1alpha2 "github.com/alibaba/pouch/cri/v1alpha2/service"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/mgr"
+	"github.com/alibaba/pouch/hookplugins"
 
 	"github.com/sirupsen/logrus"
 )
 
 // RunCriService start cri service if pouchd is specified with --enable-cri.
-func RunCriService(daemonconfig *config.Config, containerMgr mgr.ContainerMgr, imageMgr mgr.ImageMgr, volumeMgr mgr.VolumeMgr, streamRouterCh chan stream.Router, stopCh chan error, readyCh chan bool) {
+func RunCriService(daemonconfig *config.Config, containerMgr mgr.ContainerMgr, imageMgr mgr.ImageMgr, volumeMgr mgr.VolumeMgr, criPlugin hookplugins.CriPlugin, streamRouterCh chan stream.Router, stopCh chan error, readyCh chan bool) {
 	var err error
 
 	defer func() {
@@ -32,13 +32,12 @@ func RunCriService(daemonconfig *config.Config, containerMgr mgr.ContainerMgr, i
 	case "v1alpha1":
 		err = runv1alpha1(daemonconfig, containerMgr, imageMgr, streamRouterCh, readyCh)
 	case "v1alpha2":
-		err = runv1alpha2(daemonconfig, containerMgr, imageMgr, volumeMgr, streamRouterCh, readyCh)
+		err = runv1alpha2(daemonconfig, containerMgr, imageMgr, volumeMgr, criPlugin, streamRouterCh, readyCh)
 	default:
 		streamRouterCh <- nil
 		readyCh <- false
 		err = fmt.Errorf("failed to start CRI service: invalid CRI version %s, expected to be v1alpha1 or v1alpha2", daemonconfig.CriConfig.CriVersion)
 	}
-	return
 }
 
 // Start CRI service with CRI version: v1alpha1
@@ -92,16 +91,16 @@ func runv1alpha1(daemonconfig *config.Config, containerMgr mgr.ContainerMgr, ima
 }
 
 // Start CRI service with CRI version: v1alpha2
-func runv1alpha2(daemonconfig *config.Config, containerMgr mgr.ContainerMgr, imageMgr mgr.ImageMgr, volumeMgr mgr.VolumeMgr, streamRouterCh chan stream.Router, readyCh chan bool) error {
+func runv1alpha2(daemonconfig *config.Config, containerMgr mgr.ContainerMgr, imageMgr mgr.ImageMgr, volumeMgr mgr.VolumeMgr, criPlugin hookplugins.CriPlugin, streamRouterCh chan stream.Router, readyCh chan bool) error {
 	logrus.Infof("Start CRI service with CRI version: v1alpha2")
-	criMgr, err := criv1alpha2.NewCriManager(daemonconfig, containerMgr, imageMgr, volumeMgr)
+	criMgr, err := criv1alpha2.NewCriManager(daemonconfig, containerMgr, imageMgr, volumeMgr, criPlugin)
 	if err != nil {
 		streamRouterCh <- nil
 		readyCh <- false
 		return fmt.Errorf("failed to get CriManager with error: %v", err)
 	}
 
-	service, err := servicev1alpha2.NewService(daemonconfig, criMgr)
+	service, err := criv1alpha2.NewService(daemonconfig, criMgr)
 	if err != nil {
 		streamRouterCh <- nil
 		readyCh <- false

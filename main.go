@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alibaba/pouch/apis/metrics"
 	"github.com/alibaba/pouch/apis/opts"
 	optscfg "github.com/alibaba/pouch/apis/opts/config"
 	"github.com/alibaba/pouch/apis/types"
@@ -16,7 +17,6 @@ import (
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/lxcfs"
 	"github.com/alibaba/pouch/pkg/debug"
-	"github.com/alibaba/pouch/pkg/exec"
 	"github.com/alibaba/pouch/pkg/utils"
 	"github.com/alibaba/pouch/storage/quota"
 	"github.com/alibaba/pouch/version"
@@ -78,6 +78,8 @@ func setupFlags(cmd *cobra.Command) {
 	flagSet.StringVar(&cfg.CriConfig.SandboxImage, "sandbox-image", "registry.cn-hangzhou.aliyuncs.com/google-containers/pause-amd64:3.0", "The image used by sandbox container.")
 	flagSet.StringVar(&cfg.CriConfig.StreamServerPort, "stream-server-port", "10010", "The port stream server of cri is listening on.")
 	flagSet.BoolVar(&cfg.CriConfig.StreamServerReusePort, "stream-server-reuse-port", false, "Specify whether cri stream server share port with pouchd. If this is true, the listen option of pouchd should specify a tcp socket and its port should be same with stream-server-port.")
+	flagSet.IntVar(&cfg.CriConfig.CriStatsCollectPeriod, "cri-stats-collect-period", 10, "The time duration (in time.Second) cri collect stats from containerd.")
+	flagSet.BoolVar(&cfg.CriConfig.DisableCriStatsCollect, "disable-cri-stats-collect", true, "Specify whether cri collect stats from containerd.If this is true, option CriStatsCollectPeriod will take no effect.")
 	flagSet.BoolVarP(&cfg.Debug, "debug", "D", false, "Switch daemon log level to DEBUG mode")
 	flagSet.StringVarP(&cfg.ContainerdAddr, "containerd", "c", "/var/run/containerd.sock", "Specify listening address of containerd")
 	flagSet.StringVar(&cfg.ContainerdPath, "containerd-path", "", "Specify the path of containerd binary")
@@ -96,6 +98,8 @@ func setupFlags(cmd *cobra.Command) {
 	flagSet.StringVar(&cfg.ImageProxy, "image-proxy", "", "Http proxy to pull image")
 	flagSet.StringVar(&cfg.QuotaDriver, "quota-driver", "", "Set quota driver(grpquota/prjquota), if not set, it will set by kernel version")
 	flagSet.StringVar(&cfg.ConfigFile, "config-file", "/etc/pouch/config.json", "Configuration file of pouchd")
+	flagSet.StringVar(&cfg.Snapshotter, "snapshotter", "overlayfs", "Snapshotter driver of pouchd, it will be passed to containerd")
+	flagSet.BoolVar(&cfg.AllowMultiSnapshotter, "allow-multi-snapshotter", false, "If set true, pouchd will allow multi snapshotter")
 
 	// volume config
 	flagSet.StringVar(&cfg.VolumeConfig.DriverAlias, "volume-driver-alias", "", "Set volume driver alias, <name=alias>[;name1=alias1]")
@@ -103,9 +107,12 @@ func setupFlags(cmd *cobra.Command) {
 	// network config
 	flagSet.StringVar(&cfg.NetworkConfig.ExecRoot, "exec-root-dir", "", "Set exec root directory for network")
 	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.Name, "bridge-name", "", "Set default bridge name")
-	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.IP, "bip", "", "Set bridge IP")
-	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.GatewayIPv4, "default-gateway", "", "Set default bridge gateway")
-	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.FixedCIDR, "fixed-cidr", "", "Set bridge fixed CIDR")
+	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.IPv4, "bip", "", "Set bridge IP")
+	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.GatewayIPv4, "default-gateway", "", "Set default IPv4 bridge gateway")
+	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.FixedCIDRv4, "fixed-cidr", "", "Set bridge fixed CIDRv4")
+	flagSet.BoolVar(&cfg.NetworkConfig.BridgeConfig.EnableIPv6, "enable-ipv6", false, "Enable IPv6 networking")
+	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.GatewayIPv6, "default-gateway-v6", "", "Set default IPv6 bridge gateway")
+	flagSet.StringVar(&cfg.NetworkConfig.BridgeConfig.FixedCIDRv6, "fixed-cidr-v6", "", "Set bridge fixed CIDRv6")
 	flagSet.IntVar(&cfg.NetworkConfig.BridgeConfig.Mtu, "mtu", 1500, "Set bridge MTU")
 	flagSet.BoolVar(&cfg.NetworkConfig.BridgeConfig.IPTables, "iptables", true, "Enable iptables")
 	flagSet.BoolVar(&cfg.NetworkConfig.BridgeConfig.IPForward, "ipforward", true, "Enable ipforward")
@@ -117,7 +124,6 @@ func setupFlags(cmd *cobra.Command) {
 
 	// cgroup-path flag is to set parent cgroup for all containers, default is "default" staying with containerd's configuration.
 	flagSet.StringVar(&cfg.CgroupParent, "cgroup-parent", "default", "Set parent cgroup for all containers")
-	flagSet.StringVar(&cfg.PluginPath, "plugin", "", "Set the path where plugin shared library file put")
 	flagSet.StringSliceVar(&cfg.Labels, "label", []string{}, "Set metadata for Pouch daemon")
 	flagSet.BoolVar(&cfg.EnableProfiler, "enable-profiler", false, "Set if pouchd setup profiler")
 	flagSet.StringVar(&cfg.Pidfile, "pidfile", "/var/run/pouch.pid", "Save daemon pid")
@@ -148,7 +154,7 @@ func runDaemon(cmd *cobra.Command) error {
 		fmt.Printf("pouchd version: %s, build: %s, build at: %s\n", version.Version, version.GitCommit, version.BuildTime)
 		return nil
 	}
-
+	metrics.EngineVersion.WithLabelValues(version.GitCommit).Set(1)
 	// initialize log.
 	initLog()
 
@@ -164,17 +170,12 @@ func runDaemon(cmd *cobra.Command) error {
 		debug.SetupDumpStackTrap()
 	}
 
-	// initialize home dir.
-	dir := cfg.HomeDir
-
-	if dir == "" || !path.IsAbs(dir) {
-		return fmt.Errorf("invalid pouchd's home dir: %s", dir)
+	// resolve home dir.
+	dir, err := utils.ResolveHomeDir(cfg.HomeDir)
+	if err != nil {
+		return err
 	}
-	if _, err := os.Stat(dir); err != nil && os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0666); err != nil {
-			return fmt.Errorf("failed to mkdir: %v", err)
-		}
-	}
+	cfg.HomeDir = dir
 
 	// saves daemon pid to pidfile.
 	if cfg.Pidfile != "" {
@@ -254,23 +255,6 @@ func initLog() {
 		TimestampFormat: time.RFC3339Nano,
 	}
 	logrus.SetFormatter(formatter)
-}
-
-// define lxcfs processe.
-func setLxcfsProcess(processes exec.Processes) exec.Processes {
-	if !cfg.IsLxcfsEnabled {
-		return processes
-	}
-
-	p := &exec.Process{
-		Path: cfg.LxcfsBinPath,
-		Args: []string{
-			cfg.LxcfsHome,
-		},
-	}
-	processes = append(processes, p)
-
-	return processes
 }
 
 // check lxcfs config

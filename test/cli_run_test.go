@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-check/check"
 	"github.com/gotestyourself/gotestyourself/icmd"
+	"github.com/stretchr/testify/assert"
 )
 
 // PouchRunSuite is the test suite for run CLI.
@@ -122,20 +123,26 @@ func (suite *PouchRunSuite) TestRunInWrongWay(c *check.C) {
 // TestRunRestartPolicyNone is to verify restart policy none works.
 func (suite *PouchRunSuite) TestRunRestartPolicyNone(c *check.C) {
 	name := "TestRunRestartPolicyNone"
-
-	res := command.PouchRun("run", "--name", name, "-d",
-		"--restart=no", busyboxImage,
-		"sh", "-c", "sleep 1")
+	res := command.PouchRun(
+		"run",
+		"-d",
+		"--name", name,
+		"--restart=no",
+		busyboxImage,
+		"sh", "-c", "echo 'start one time'; sleep 0.1")
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
 
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 
-	res = command.PouchRun("ps")
-	res.Assert(c, icmd.Success)
+	output := command.PouchRun("logs", name).Stdout()
+	lines, err := util.StringSliceTrimSpace(strings.Split(output, "\n"))
+	if err != nil {
+		c.Errorf("failed to call StringSliceTrimSpace: %v", err)
+	}
 
-	if out := res.Combined(); strings.Contains(out, name) {
-		c.Fatalf("expect container %s to be exited: %s\n", name, out)
+	if len(lines) != 1 {
+		c.Errorf("container should not restart when restart-policy is no, but we got %+v", lines)
 	}
 }
 
@@ -222,13 +229,15 @@ func (suite *PouchRunSuite) TestRunWithCapability(c *check.C) {
 
 // TestRunWithoutCapability tests running container with --cap-drop
 func (suite *PouchRunSuite) TestRunWithoutCapability(c *check.C) {
-	capability := "chown"
+	capability := "CHOWN"
 	name := "run-capability"
 	expt := icmd.Expected{
-		Err: "Operation not permitted",
+		ExitCode: 1,
+		Out:      "Operation not permitted",
 	}
-	command.PouchRun("run", "--name", name, "--cap-drop", capability,
+	err := command.PouchRun("run", "--name", name, "--cap-drop", capability,
 		busyboxImage, "chown", "755", "/tmp").Compare(expt)
+	c.Assert(err, check.IsNil)
 	defer DelContainerForceMultyTime(c, name)
 }
 
@@ -302,12 +311,9 @@ func (suite *PouchRunSuite) TestRunWithExitCode(c *check.C) {
 	ret.Assert(c, icmd.Expected{ExitCode: 101})
 
 	// test container ExitCode == 101
-	output := command.PouchRun("inspect", cname).Stdout()
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].State.ExitCode, check.Equals, int64(101))
+	exitCode, err := inspectFilter(cname, ".State.ExitCode")
+	c.Assert(err, check.IsNil)
+	c.Assert(exitCode, check.Equals, "101")
 }
 
 // TestRunWithRM is to verify the valid running container with rm flag
@@ -365,35 +371,7 @@ func (suite *PouchRunSuite) TestRunWithDisableNetworkFiles(c *check.C) {
 	}
 }
 
-// TestRunWithShm is to verify the valid running container
-// with shm-size
-func (suite *PouchRunMemorySuite) TestRunWithShm(c *check.C) {
-	cname := "TestRunWithShm"
-	res := command.PouchRun("run", "-d", "--shm-size", "1g",
-		"--name", cname, busyboxImage, "top")
-	defer DelContainerForceMultyTime(c, cname)
-	res.Assert(c, icmd.Success)
-
-	// test if the value is in inspect result
-	res = command.PouchRun("inspect", cname)
-	res.Assert(c, icmd.Success)
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(res.Stdout()), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(int64(*result[0].HostConfig.ShmSize),
-		check.Equals, int64(1073741824))
-
-	containerID := result[0].ID
-
-	res = command.PouchRun("exec", containerID, "df", "-k", "/dev/shm")
-	res.Assert(c, icmd.Success)
-
-	c.Assert(util.PartialEqual(res.Stdout(), "1048576"), check.IsNil)
-}
-
-// TestRunSetRunningFlag is to verfy whether set Running Flag in ContainerState
+// TestRunSetRunningFlag is to verify whether set Running Flag in ContainerState
 // when started a container
 func (suite *PouchRunSuite) TestRunSetRunningFlag(c *check.C) {
 	cname := "TestRunSetRunningFlag"
@@ -402,14 +380,9 @@ func (suite *PouchRunSuite) TestRunSetRunningFlag(c *check.C) {
 	res.Assert(c, icmd.Success)
 
 	// test if the value is in inspect result
-	res = command.PouchRun("inspect", cname)
-	res.Assert(c, icmd.Success)
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(res.Stdout()), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].State.Running, check.Equals, true)
+	state, err := inspectFilter(cname, ".State.Running")
+	c.Assert(err, check.IsNil)
+	c.Assert(state, check.Equals, "true")
 }
 
 func (suite *PouchRunSuite) TestRunWithMtab(c *check.C) {
@@ -437,9 +410,19 @@ func (suite *PouchRunSuite) TestRunWithEnv(c *check.C) {
 	res := command.PouchRun("run", "--rm",
 		"--env", "A=a,b,c", // should not split args by comma
 		"--env", "B=b1",
-		"docker.io/library/alpine",
+		busyboxImage,
 		"sh", "-c", "echo ${A}-${B}",
 	)
 	res.Assert(c, icmd.Success)
 	c.Assert(strings.TrimSpace(res.Stdout()), check.Equals, "a,b,c-b1")
+}
+
+// TestRunWithTty tests running container with -tty flag and attach stdin in a non-tty client.
+func (suite *PouchRunSuite) TestRunWithTty(c *check.C) {
+	name := "TestRunWithTty"
+	res := command.PouchRun("run", "-i", "-t", "--name", name, busyboxImage, "sleep", "100000")
+	defer DelContainerForceMultyTime(c, name)
+
+	errString := res.Stderr()
+	assert.Equal(c, errString, "Error: the input device is not a TTY\n")
 }

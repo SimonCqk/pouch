@@ -8,10 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-var (
-	testHost = "unix:///var/run/pouchd.sock"
-)
-
 func TestNewAPIClient(t *testing.T) {
 	assert := assert.New(t)
 	kvs := map[string]bool{
@@ -43,7 +39,7 @@ func Test_generateBaseURL(t *testing.T) {
 		args args
 		want string
 	}{
-	// TODO: Add test cases.
+		// TODO: Add test cases.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

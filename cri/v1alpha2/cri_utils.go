@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,8 +17,13 @@ import (
 	apitypes "github.com/alibaba/pouch/apis/types"
 	anno "github.com/alibaba/pouch/cri/annotations"
 	runtime "github.com/alibaba/pouch/cri/apis/v1alpha2"
+	"github.com/alibaba/pouch/cri/stream"
+	metatypes "github.com/alibaba/pouch/cri/v1alpha2/types"
+	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/mgr"
 	"github.com/alibaba/pouch/pkg/errtypes"
+	"github.com/alibaba/pouch/pkg/netutils"
+	"github.com/alibaba/pouch/pkg/randomid"
 	"github.com/alibaba/pouch/pkg/utils"
 
 	"github.com/containerd/cgroups"
@@ -26,6 +33,43 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
+
+func toStreamConfig(cfg *config.Config) (stream.Config, error) {
+	var address string
+	port := cfg.CriConfig.StreamServerPort
+	// If stream server reuse the pouchd's port, extract the ip and port from pouchd's listening addresses.
+	if cfg.CriConfig.StreamServerReusePort {
+		address, port = utils.ExtractIPAndPortFromAddresses(cfg.Listen)
+		if port == "" {
+			return stream.Config{}, fmt.Errorf("failed to extract stream server's port from pouchd's listening addresses")
+		}
+	}
+
+	// If the reused pouchd's port is https, the url that stream server return should be with https scheme.
+	reuseHTTPSPort := cfg.CriConfig.StreamServerReusePort && cfg.TLS.Key != "" && cfg.TLS.Cert != ""
+
+	ip := net.ParseIP(address)
+	// If the address is "" or "0.0.0.0", choose a proper one by ourselves.
+	if ip == nil || ip.IsUnspecified() {
+		a, err := netutils.ChooseBindAddress(nil)
+		if err != nil {
+			return stream.Config{}, fmt.Errorf("failed to get stream server address: %v", err)
+		}
+		address = a.String()
+	}
+
+	streamCfg := stream.DefaultConfig
+	streamCfg.Address = net.JoinHostPort(address, port)
+	streamCfg.BaseURL = &url.URL{
+		Scheme: "http",
+		Host:   streamCfg.Address,
+	}
+	if reuseHTTPSPort {
+		streamCfg.BaseURL.Scheme = "https"
+	}
+
+	return streamCfg, nil
+}
 
 func parseUint32(s string) (uint32, error) {
 	n, err := strconv.ParseUint(s, 10, 32)
@@ -46,6 +90,23 @@ func toCriTimestamp(t string) (int64, error) {
 	}
 
 	return result.UnixNano(), nil
+}
+
+// generateSandboxID generates an ID for newly created sandbox meta.
+// We must ensure that this ID has not used yet.
+func (c *CriManager) generateSandboxID(ctx context.Context) (string, error) {
+	var id string
+	for {
+		id = randomid.Generate()
+		_, err := c.ContainerMgr.Get(ctx, id)
+		if err != nil {
+			if errtypes.IsNotfound(err) {
+				break
+			}
+			return "", err
+		}
+	}
+	return id, nil
 }
 
 // generateEnvList converts KeyValue list to a list of strings, in the form of
@@ -205,14 +266,19 @@ func applySandboxSecurityContext(lc *runtime.LinuxPodSandboxConfig, config *apit
 		sc = &runtime.LinuxContainerSecurityContext{
 			SupplementalGroups: lc.SecurityContext.SupplementalGroups,
 			RunAsUser:          lc.SecurityContext.RunAsUser,
+			RunAsGroup:         lc.SecurityContext.RunAsGroup,
 			ReadonlyRootfs:     lc.SecurityContext.ReadonlyRootfs,
 			SelinuxOptions:     lc.SecurityContext.SelinuxOptions,
 			NamespaceOptions:   lc.SecurityContext.NamespaceOptions,
 		}
 	}
 
-	modifyContainerConfig(sc, config)
-	err := modifyHostConfig(sc, hc)
+	err := modifyContainerConfig(sc, config)
+	if err != nil {
+		return err
+	}
+
+	err = modifyHostConfig(sc, hc)
 	if err != nil {
 		return err
 	}
@@ -241,8 +307,43 @@ func applySandboxLinuxOptions(hc *apitypes.HostConfig, lc *runtime.LinuxPodSandb
 	return nil
 }
 
+// applySandboxRuntimeHandler applies the runtime of container specified by the caller.
+func (c *CriManager) applySandboxRuntimeHandler(sandboxMeta *metatypes.SandboxMeta, runtimehandler string, annotations map[string]string) error {
+	if runtimehandler == "" {
+		// apply the annotation of io.kubernetes.runtime which specify the runtime of container.
+		// NOTE: Deprecated
+		runtime, ok := annotations[anno.KubernetesRuntime]
+		if !ok {
+			return nil
+		}
+		runtimehandler = runtime
+	}
+	sandboxMeta.Runtime = runtimehandler
+	if err := c.SandboxStore.Put(sandboxMeta); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applySandboxAnnotations applies the annotations extended.
+func (c *CriManager) applySandboxAnnotations(sandboxMeta *metatypes.SandboxMeta, annotations map[string]string) error {
+	// apply the annotation of io.kubernetes.lxcfs.enabled
+	// which specify whether to enable lxcfs for a container.
+	if lxcfsEnabled, ok := annotations[anno.LxcfsEnabled]; ok {
+		enableLxcfs, err := strconv.ParseBool(lxcfsEnabled)
+		if err != nil {
+			return err
+		}
+		sandboxMeta.LxcfsEnabled = enableLxcfs
+		if err := c.SandboxStore.Put(sandboxMeta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // makeSandboxPouchConfig returns apitypes.ContainerCreateConfig based on runtime.PodSandboxConfig.
-func makeSandboxPouchConfig(config *runtime.PodSandboxConfig, image string) (*apitypes.ContainerCreateConfig, error) {
+func makeSandboxPouchConfig(config *runtime.PodSandboxConfig, runtimehandler, image string) (*apitypes.ContainerCreateConfig, error) {
 	// Merge annotations and labels because pouch supports only labels.
 	labels := makeLabels(config.GetLabels(), config.GetAnnotations())
 	// Apply a label to distinguish sandboxes from regular containers.
@@ -251,9 +352,8 @@ func makeSandboxPouchConfig(config *runtime.PodSandboxConfig, image string) (*ap
 	hc := &apitypes.HostConfig{}
 
 	// Apply runtime options.
-	if annotations := config.GetAnnotations(); annotations != nil {
-		hc.Runtime = annotations[anno.KubernetesRuntime]
-	}
+	// NOTE: whether to add UntrustedWorkload
+	hc.Runtime = runtimehandler
 
 	createConfig := &apitypes.ContainerCreateConfig{
 		ContainerConfig: apitypes.ContainerConfig{
@@ -450,28 +550,23 @@ func setupSandboxFiles(sandboxRootDir string, config *runtime.PodSandboxConfig) 
 
 // setupPodNetwork sets up the network of PodSandbox and return the netnsPath of PodSandbox
 // and do nothing when networkNamespaceMode equals runtime.NamespaceMode_NODE.
-func (c *CriManager) setupPodNetwork(ctx context.Context, id string, config *runtime.PodSandboxConfig) (string, error) {
+func (c *CriManager) setupPodNetwork(ctx context.Context, id string, config *runtime.PodSandboxConfig) error {
 	container, err := c.ContainerMgr.Get(ctx, id)
 	if err != nil {
-		return "", err
+		return err
 	}
 	netnsPath := containerNetns(container)
 	if netnsPath == "" {
-		return "", fmt.Errorf("failed to find network namespace path for sandbox %q", id)
+		return fmt.Errorf("failed to find network namespace path for sandbox %q", id)
 	}
 
-	err = c.CniMgr.SetUpPodNetwork(&ocicni.PodNetwork{
+	return c.CniMgr.SetUpPodNetwork(&ocicni.PodNetwork{
 		Name:         config.GetMetadata().GetName(),
 		Namespace:    config.GetMetadata().GetNamespace(),
 		ID:           id,
 		NetNS:        netnsPath,
 		PortMappings: toCNIPortMappings(config.GetPortMappings()),
 	})
-	if err != nil {
-		return "", err
-	}
-
-	return netnsPath, nil
 }
 
 // Container related tool functions.
@@ -507,11 +602,6 @@ func parseContainerName(name string) (*runtime.ContainerMetadata, error) {
 		Name:    parts[1],
 		Attempt: attempt,
 	}, nil
-}
-
-// makeupLogPath makes up the log path of container from log directory and its metadata.
-func makeupLogPath(logDirectory string, metadata *runtime.ContainerMetadata) string {
-	return filepath.Join(logDirectory, metadata.Name, fmt.Sprintf("%d.log", metadata.Attempt))
 }
 
 // modifyContainerNamespaceOptions apply namespace options for container.
@@ -673,43 +763,61 @@ func modifyHostConfig(sc *runtime.LinuxContainerSecurityContext, hostConfig *api
 }
 
 // modifyContainerConfig applies container security context config to pouch's Config.
-func modifyContainerConfig(sc *runtime.LinuxContainerSecurityContext, config *apitypes.ContainerConfig) {
+func modifyContainerConfig(sc *runtime.LinuxContainerSecurityContext, config *apitypes.ContainerConfig) error {
 	if sc == nil {
-		return
+		return nil
 	}
+
+	var userStr, groupStr string
+
 	if sc.RunAsUser != nil {
-		config.User = strconv.FormatInt(sc.GetRunAsUser().Value, 10)
+		userStr = strconv.FormatInt(sc.RunAsUser.GetValue(), 10)
 	}
 	if sc.RunAsUsername != "" {
-		config.User = sc.RunAsUsername
+		userStr = sc.RunAsUsername
 	}
+	if sc.RunAsGroup != nil {
+		groupStr = strconv.FormatInt(sc.RunAsGroup.GetValue(), 10)
+	}
+
+	if userStr == "" {
+		// run_as_group should only be specified when run_as_user or run_as_username is specified;
+		// otherwise, the runtime MUST error.
+		if groupStr != "" {
+			return fmt.Errorf("user group %q is specified without user", groupStr)
+		}
+		return nil
+	}
+	if groupStr != "" {
+		userStr = userStr + ":" + groupStr
+	}
+
+	config.User = userStr
+	return nil
 }
 
 // applyContainerSecurityContext updates pouch container options according to security context.
 func applyContainerSecurityContext(lc *runtime.LinuxContainerConfig, podSandboxID string, config *apitypes.ContainerConfig, hc *apitypes.HostConfig) error {
-	modifyContainerConfig(lc.SecurityContext, config)
-
-	err := modifyHostConfig(lc.SecurityContext, hc)
+	sc := lc.SecurityContext
+	err := modifyContainerConfig(sc, config)
 	if err != nil {
 		return err
 	}
 
-	modifyContainerNamespaceOptions(lc.SecurityContext.GetNamespaceOptions(), podSandboxID, hc)
+	err = modifyHostConfig(sc, hc)
+	if err != nil {
+		return err
+	}
+
+	modifyContainerNamespaceOptions(sc.GetNamespaceOptions(), podSandboxID, hc)
 
 	return nil
 }
 
 // Apply Linux-specific options if applicable.
-func (c *CriManager) updateCreateConfig(createConfig *apitypes.ContainerCreateConfig, config *runtime.ContainerConfig, sandboxConfig *runtime.PodSandboxConfig, podSandboxID string) error {
+func (c *CriManager) updateCreateConfig(createConfig *apitypes.ContainerCreateConfig, config *runtime.ContainerConfig, sandboxConfig *runtime.PodSandboxConfig, sandboxMeta *metatypes.SandboxMeta) error {
 	// Apply runtime options.
-	res, err := c.SandboxStore.Get(podSandboxID)
-	if err != nil {
-		return fmt.Errorf("failed to get metadata of %q from SandboxStore: %v", podSandboxID, err)
-	}
-	sandboxMeta := res.(*SandboxMeta)
-	if sandboxMeta.Runtime != "" {
-		createConfig.HostConfig.Runtime = sandboxMeta.Runtime
-	}
+	createConfig.HostConfig.Runtime = sandboxMeta.Runtime
 
 	createConfig.HostConfig.EnableLxcfs = sandboxMeta.LxcfsEnabled
 
@@ -725,7 +833,7 @@ func (c *CriManager) updateCreateConfig(createConfig *apitypes.ContainerCreateCo
 		}
 
 		// Apply security context.
-		if err := applyContainerSecurityContext(lc, podSandboxID, &createConfig.ContainerConfig, createConfig.HostConfig); err != nil {
+		if err := applyContainerSecurityContext(lc, sandboxMeta.ID, &createConfig.ContainerConfig, createConfig.HostConfig); err != nil {
 			return fmt.Errorf("failed to apply container security context for container %q: %v", config.Metadata.Name, err)
 		}
 	}
@@ -829,23 +937,25 @@ func containerNetns(container *mgr.Container) string {
 
 // imageToCriImage converts pouch image API to CRI image API.
 func imageToCriImage(image *apitypes.ImageInfo) (*runtime.Image, error) {
-	uid := &runtime.Int64Value{}
-	imageUID, username := getUserFromImageUser(image.Config.User)
-	if imageUID != nil {
-		uid.Value = *imageUID
+	if image == nil || image.Config == nil {
+		return nil, fmt.Errorf("unable to convert a nil pointer to a runtime API image")
 	}
-
 	size := uint64(image.Size)
 	// TODO: improve type ImageInfo to include RepoTags and RepoDigests.
-	return &runtime.Image{
+	runtimeImage := &runtime.Image{
 		Id:          image.ID,
 		RepoTags:    image.RepoTags,
 		RepoDigests: image.RepoDigests,
 		Size_:       size,
-		Uid:         uid,
-		Username:    username,
 		Volumes:     parseVolumesFromPouch(image.Config.Volumes),
-	}, nil
+	}
+
+	imageUID, username := getUserFromImageUser(image.Config.User)
+	if imageUID != nil {
+		runtimeImage.Uid = &runtime.Int64Value{Value: *imageUID}
+	}
+	runtimeImage.Username = username
+	return runtimeImage, nil
 }
 
 // ensureSandboxImageExists pulls the image when it's not present.
@@ -896,25 +1006,6 @@ func parseUserFromImageUser(id string) string {
 	return id
 }
 
-func (c *CriManager) attachLog(logPath string, containerID string, openStdin bool) error {
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
-	if err != nil {
-		return fmt.Errorf("failed to create container for opening log file failed: %v", err)
-	}
-	// Attach to the container to get log.
-	attachConfig := &mgr.AttachConfig{
-		Stdin:      openStdin,
-		Stdout:     true,
-		Stderr:     true,
-		CriLogFile: f,
-	}
-	err = c.ContainerMgr.Attach(context.Background(), containerID, attachConfig)
-	if err != nil {
-		return fmt.Errorf("failed to attach to container %q to get its log: %v", containerID, err)
-	}
-	return nil
-}
-
 func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Container) (*runtime.ContainerStats, error) {
 	var usedBytes, inodesUsed uint64
 
@@ -923,7 +1014,7 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		return nil, fmt.Errorf("failed to get metadata of container %q: %v", meta.ID, err)
 	}
 
-	sn, err := c.SnapshotStore.Get(meta.ID)
+	sn, err := c.SnapshotStore.Get(meta.SnapshotID)
 	if err == nil {
 		usedBytes = sn.Size
 		inodesUsed = sn.Inodes
@@ -935,8 +1026,8 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		FsId: &runtime.FilesystemIdentifier{
 			Mountpoint: c.imageFSPath,
 		},
-		UsedBytes:  &runtime.UInt64Value{usedBytes},
-		InodesUsed: &runtime.UInt64Value{inodesUsed},
+		UsedBytes:  &runtime.UInt64Value{Value: usedBytes},
+		InodesUsed: &runtime.UInt64Value{Value: inodesUsed},
 	}
 	labels, annotations := extractLabels(meta.Config.Labels)
 
@@ -961,13 +1052,13 @@ func (c *CriManager) getContainerMetrics(ctx context.Context, meta *mgr.Containe
 		if metrics.CPU != nil && metrics.CPU.Usage != nil {
 			cs.Cpu = &runtime.CpuUsage{
 				Timestamp:            stats.Timestamp.UnixNano(),
-				UsageCoreNanoSeconds: &runtime.UInt64Value{metrics.CPU.Usage.Total},
+				UsageCoreNanoSeconds: &runtime.UInt64Value{Value: metrics.CPU.Usage.Total},
 			}
 		}
 		if metrics.Memory != nil && metrics.Memory.Usage != nil {
 			cs.Memory = &runtime.MemoryUsage{
 				Timestamp:       stats.Timestamp.UnixNano(),
-				WorkingSetBytes: &runtime.UInt64Value{metrics.Memory.Usage.Usage},
+				WorkingSetBytes: &runtime.UInt64Value{Value: metrics.Memory.Usage.Usage},
 			}
 		}
 	}

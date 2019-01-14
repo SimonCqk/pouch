@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/alibaba/pouch/apis/metrics"
 	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/daemon/mgr"
 	"github.com/alibaba/pouch/pkg/httputils"
+	"github.com/alibaba/pouch/pkg/streams"
 	"github.com/alibaba/pouch/pkg/utils"
 	"github.com/alibaba/pouch/pkg/utils/filters"
+	util_metrics "github.com/alibaba/pouch/pkg/utils/metrics"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/gorilla/mux"
@@ -22,27 +26,32 @@ import (
 )
 
 func (s *Server) createContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	label := util_metrics.ActionCreateLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	config := &types.ContainerCreateConfig{}
 	reader := req.Body
-	var ex error
-	if s.ContainerPlugin != nil {
-		logrus.Infof("invoke container pre-create hook in plugin")
-		if reader, ex = s.ContainerPlugin.PreCreate(req.Body); ex != nil {
-			return errors.Wrapf(ex, "pre-create plugin point execute failed")
-		}
-	}
 	// decode request body
 	if err := json.NewDecoder(reader).Decode(config); err != nil {
-		return httputils.NewHTTPError(err, http.StatusBadRequest)
-	}
-	// validate request body
-	if err := config.Validate(strfmt.NewFormats()); err != nil {
 		return httputils.NewHTTPError(err, http.StatusBadRequest)
 	}
 
 	logCreateOptions("container", config)
 
+	// validate request body
+	if err := config.Validate(strfmt.NewFormats()); err != nil {
+		return httputils.NewHTTPError(err, http.StatusBadRequest)
+	}
+
 	name := req.FormValue("name")
+	//consider set specific id by url params
+	specificID := req.FormValue("specificId")
+	if specificID != "" {
+		config.SpecificID = specificID
+	}
 
 	// to do compensation to potential nil pointer after validation
 	if config.HostConfig == nil {
@@ -56,6 +65,8 @@ func (s *Server) createContainer(ctx context.Context, rw http.ResponseWriter, re
 	if err != nil {
 		return err
 	}
+
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	return EncodeResponse(rw, http.StatusCreated, container)
 }
@@ -81,6 +92,7 @@ func (s *Server) getContainer(ctx context.Context, rw http.ResponseWriter, req *
 		State:        c.State,
 		Config:       c.Config,
 		HostConfig:   c.HostConfig,
+		LogPath:      c.LogPath,
 		Snapshotter:  c.Snapshotter,
 		RestartCount: c.RestartCount,
 		GraphDriver: &types.GraphDriverData{
@@ -89,6 +101,14 @@ func (s *Server) getContainer(ctx context.Context, rw http.ResponseWriter, req *
 		},
 		Mounts:          mounts,
 		NetworkSettings: c.NetworkSettings,
+		Path:            c.Path,
+		Args:            c.Args,
+		ResolvConfPath:  c.ResolvConfPath,
+		HostnamePath:    c.HostnamePath,
+		HostsPath:       c.HostsPath,
+		Driver:          c.Driver,
+		MountLabel:      c.MountLabel,
+		ProcessLabel:    c.ProcessLabel,
 	}
 
 	return EncodeResponse(rw, http.StatusOK, container)
@@ -149,6 +169,12 @@ func (s *Server) getContainers(ctx context.Context, rw http.ResponseWriter, req 
 }
 
 func (s *Server) startContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	label := util_metrics.ActionStartLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	name := mux.Vars(req)["name"]
 
 	options := &types.ContainerStartOptions{
@@ -161,6 +187,8 @@ func (s *Server) startContainer(ctx context.Context, rw http.ResponseWriter, req
 		return err
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
 }
@@ -170,6 +198,11 @@ func (s *Server) restartContainer(ctx context.Context, rw http.ResponseWriter, r
 		t   int
 		err error
 	)
+	label := util_metrics.ActionRestartLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
 
 	if v := req.FormValue("t"); v != "" {
 		if t, err = strconv.Atoi(v); err != nil {
@@ -183,6 +216,8 @@ func (s *Server) restartContainer(ctx context.Context, rw http.ResponseWriter, r
 		return err
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
 }
@@ -192,6 +227,12 @@ func (s *Server) stopContainer(ctx context.Context, rw http.ResponseWriter, req 
 		t   int
 		err error
 	)
+
+	label := util_metrics.ActionStopLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
 
 	if v := req.FormValue("t"); v != "" {
 		if t, err = strconv.Atoi(v); err != nil {
@@ -204,6 +245,8 @@ func (s *Server) stopContainer(ctx context.Context, rw http.ResponseWriter, req 
 	if err = s.ContainerMgr.Stop(ctx, name, int64(t)); err != nil {
 		return err
 	}
+
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
@@ -232,6 +275,12 @@ func (s *Server) unpauseContainer(ctx context.Context, rw http.ResponseWriter, r
 }
 
 func (s *Server) renameContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	label := util_metrics.ActionRenameLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	oldName := mux.Vars(req)["name"]
 	newName := req.FormValue("name")
 
@@ -239,36 +288,58 @@ func (s *Server) renameContainer(ctx context.Context, rw http.ResponseWriter, re
 		return err
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
 }
 
 func (s *Server) attachContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	name := mux.Vars(req)["name"]
-
 	_, upgrade := req.Header["Upgrade"]
 
-	hijacker, ok := rw.(http.Hijacker)
-	if !ok {
-		return fmt.Errorf("not a hijack connection, container: %s", name)
+	var (
+		err     error
+		closeFn func() error
+		attach  = new(streams.AttachConfig)
+		stdin   io.ReadCloser
+		stdout  io.Writer
+	)
+
+	stdin, stdout, closeFn, err = openHijackConnection(rw)
+	if err != nil {
+		return err
 	}
 
-	attach := &mgr.AttachConfig{
-		Hijack:  hijacker,
-		Stdin:   req.FormValue("stdin") == "1",
-		Stdout:  true,
-		Stderr:  true,
-		Upgrade: upgrade,
+	// close hijack stream
+	defer closeFn()
+
+	if upgrade {
+		fmt.Fprintf(stdout, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+	} else {
+		fmt.Fprintf(stdout, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
 	}
 
-	if err := s.ContainerMgr.Attach(ctx, name, attach); err != nil {
-		// TODO handle error
-	}
+	attach.UseStdin = httputils.BoolValue(req, "stdin")
+	attach.Stdin = stdin
+	attach.UseStdout = true
+	attach.Stdout = stdout
+	attach.UseStderr = true
+	attach.Stderr = stdout
 
+	if err := s.ContainerMgr.AttachContainerIO(ctx, name, attach); err != nil {
+		stdout.Write([]byte(err.Error() + "\r\n"))
+	}
 	return nil
 }
 
 func (s *Server) updateContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	label := util_metrics.ActionUpdateLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	config := &types.UpdateConfig{}
 
 	// set pre update hook plugin
@@ -285,6 +356,10 @@ func (s *Server) updateContainer(ctx context.Context, rw http.ResponseWriter, re
 	if err := json.NewDecoder(reader).Decode(config); err != nil {
 		return httputils.NewHTTPError(err, http.StatusBadRequest)
 	}
+	// validate request body
+	if err := config.Validate(strfmt.NewFormats()); err != nil {
+		return httputils.NewHTTPError(err, http.StatusBadRequest)
+	}
 
 	name := mux.Vars(req)["name"]
 
@@ -292,11 +367,19 @@ func (s *Server) updateContainer(ctx context.Context, rw http.ResponseWriter, re
 		return httputils.NewHTTPError(err, http.StatusInternalServerError)
 	}
 
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
+
 	rw.WriteHeader(http.StatusOK)
 	return nil
 }
 
 func (s *Server) upgradeContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	label := util_metrics.ActionUpgradeLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	config := &types.ContainerUpgradeConfig{}
 	// decode request body
 	if err := json.NewDecoder(req.Body).Decode(config); err != nil {
@@ -312,6 +395,8 @@ func (s *Server) upgradeContainer(ctx context.Context, rw http.ResponseWriter, r
 	if err := s.ContainerMgr.Upgrade(ctx, name, config); err != nil {
 		return err
 	}
+
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	rw.WriteHeader(http.StatusOK)
 	return nil
@@ -339,9 +424,7 @@ func (s *Server) logsContainer(ctx context.Context, rw http.ResponseWriter, req 
 		Until:      req.Form.Get("until"),
 		Follow:     httputils.BoolValue(req, "follow"),
 		Timestamps: httputils.BoolValue(req, "timestamps"),
-
-		// TODO: support the details
-		// Details:    httputils.BoolValue(r, "details"),
+		Details:    httputils.BoolValue(req, "details"),
 	}
 
 	name := mux.Vars(req)["name"]
@@ -349,7 +432,6 @@ func (s *Server) logsContainer(ctx context.Context, rw http.ResponseWriter, req 
 	if err != nil {
 		return err
 	}
-
 	writeLogStream(ctx, rw, tty, opts, msgCh)
 	return nil
 }
@@ -357,11 +439,7 @@ func (s *Server) logsContainer(ctx context.Context, rw http.ResponseWriter, req 
 func (s *Server) statsContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	name := mux.Vars(req)["name"]
 
-	var stream bool
-	if _, ok := req.Form["stream"]; !ok {
-		stream = true
-	}
-	stream = httputils.BoolValue(req, "stream")
+	stream := httputils.BoolValue(req, "stream")
 
 	if !stream {
 		rw.Header().Set("Content-Type", "application/json")
@@ -402,6 +480,12 @@ func (s *Server) resizeContainer(ctx context.Context, rw http.ResponseWriter, re
 }
 
 func (s *Server) removeContainers(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	label := util_metrics.ActionDeleteLabel
+	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
+		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	name := mux.Vars(req)["name"]
 
 	option := &types.ContainerRemoveOptions{
@@ -414,6 +498,8 @@ func (s *Server) removeContainers(ctx context.Context, rw http.ResponseWriter, r
 	if err := s.ContainerMgr.Remove(ctx, name, option); err != nil {
 		return err
 	}
+
+	metrics.ContainerSuccessActionsCounter.WithLabelValues(label).Inc()
 
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
@@ -486,4 +572,20 @@ func (s *Server) deleteContainerCheckpoint(ctx context.Context, rw http.Response
 
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+func (s *Server) commitContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	options := &types.ContainerCommitOptions{
+		Repository: req.FormValue("repo"),
+		Tag:        req.FormValue("tag"),
+		Author:     req.FormValue("author"),
+		Comment:    req.FormValue("comment"),
+	}
+
+	id, err := s.ContainerMgr.Commit(ctx, req.FormValue("container"), options)
+	if err != nil {
+		return err
+	}
+
+	return EncodeResponse(rw, http.StatusCreated, id)
 }

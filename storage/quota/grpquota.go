@@ -18,10 +18,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var (
-	grpQuotaType = "grpquota"
-)
-
 // GrpQuotaDriver represents group quota driver.
 type GrpQuotaDriver struct {
 	lock sync.Mutex
@@ -94,7 +90,7 @@ func (quota *GrpQuotaDriver) EnforceQuota(dir string) (string, error) {
 			header[4] = 0x01
 		}
 
-		if writeErr := ioutil.WriteFile(filename, header, 644); writeErr != nil {
+		if writeErr := ioutil.WriteFile(filename, header, 0644); writeErr != nil {
 			return mountPoint, errors.Wrapf(writeErr, "failed to write file, filename: (%s), vfs version: (%s)",
 				filename, vfsVersion)
 		}
@@ -181,8 +177,9 @@ func (quota *GrpQuotaDriver) CheckMountpoint(devID uint64) (string, bool, string
 	}
 
 	var (
-		mountPoint string
-		fsType     string
+		enableQuota bool
+		mountPoint  string
+		fsType      string
 	)
 
 	// Two formats of group quota.
@@ -199,17 +196,25 @@ func (quota *GrpQuotaDriver) CheckMountpoint(devID uint64) (string, bool, string
 			continue
 		}
 
+		// check the shortest mountpoint.
+		if mountPoint != "" && len(mountPoint) < len(parts[1]) {
+			continue
+		}
+
 		// get device's mountpoint and fs type.
 		mountPoint = parts[1]
 		fsType = parts[2]
 
-		// check the device turn on the prpquota or not.
+		// check the device turn on the grpquota or not.
 		if strings.Contains(parts[3], "grpquota") || strings.Contains(parts[3], "grpjquota") {
-			return mountPoint, true, fsType
+			enableQuota = true
 		}
 	}
 
-	return mountPoint, false, fsType
+	logrus.Debugf("check device: (%d), mountpoint: (%s), enableQuota: (%v), fsType: (%s)",
+		devID, mountPoint, enableQuota, fsType)
+
+	return mountPoint, enableQuota, fsType
 }
 
 // SetDiskQuota is used to set quota for directory.
@@ -224,14 +229,6 @@ func (quota *GrpQuotaDriver) SetDiskQuota(dir string, size string, quotaID uint3
 		return errors.Errorf("failed to find mountpoint, dir: (%s)", dir)
 	}
 
-	id, err := quota.SetSubtree(dir, quotaID)
-	if err != nil {
-		return errors.Wrapf(err, "failed to set subtree, dir: (%s), quota id: (%d)", dir, quotaID)
-	}
-	if id == 0 {
-		return errors.Errorf("failed to find quota id to set subtree")
-	}
-
 	// transfer limit from kbyte to byte
 	limit, err := bytefmt.ToKilobytes(size)
 	if err != nil {
@@ -240,6 +237,14 @@ func (quota *GrpQuotaDriver) SetDiskQuota(dir string, size string, quotaID uint3
 
 	if err := checkDevLimit(dir, limit*1024); err != nil {
 		return err
+	}
+
+	id, err := quota.SetSubtree(dir, quotaID)
+	if err != nil {
+		return errors.Wrapf(err, "failed to set subtree, dir: (%s), quota id: (%d)", dir, quotaID)
+	}
+	if id == 0 {
+		return errors.Errorf("failed to find quota id to set subtree")
 	}
 
 	return quota.setQuota(id, limit, mountPoint)

@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alibaba/pouch/apis/types"
@@ -90,7 +92,11 @@ func StartContainerOk(c *check.C, cname string) {
 
 // StopContainerOk stops the container and asserts success..
 func StopContainerOk(c *check.C, cname string) {
-	resp, err := request.Post("/containers/" + cname + "/stop")
+	q := url.Values{}
+	q.Add("t", "1")
+	query := request.WithQuery(q)
+
+	resp, err := request.Post("/containers/"+cname+"/stop", query)
 	c.Assert(err, check.IsNil)
 
 	defer resp.Body.Close()
@@ -122,17 +128,14 @@ func CheckContainerRunning(c *check.C, cname string, isRunning bool) {
 	c.Assert(gotRunning, check.Equals, isRunning)
 }
 
-// DelContainerForceOk forcely deletes the container and asserts success.
-func DelContainerForceOk(c *check.C, cname string) {
-	resp, err := delContainerForce(cname)
-	c.Assert(err, check.IsNil)
-
-	defer resp.Body.Close()
-	CheckRespStatus(c, resp, 204)
-}
-
 func delContainerForce(cname string) (*http.Response, error) {
+	// first stop the container, then delete it
 	q := url.Values{}
+	q.Add("t", "1")
+	resp, _ := request.Post("/containers/"+cname+"/stop", request.WithQuery(q))
+	defer resp.Body.Close()
+
+	q = url.Values{}
 	q.Add("force", "true")
 	q.Add("v", "true")
 
@@ -152,7 +155,6 @@ func PauseContainerOk(c *check.C, cname string) {
 func UnpauseContainerOk(c *check.C, cname string) {
 	resp, err := request.Post("/containers/" + cname + "/unpause")
 	c.Assert(err, check.IsNil)
-
 	defer resp.Body.Close()
 	CheckRespStatus(c, resp, 204)
 }
@@ -160,7 +162,6 @@ func UnpauseContainerOk(c *check.C, cname string) {
 // DelContainerForceMultyTime forcely deletes the container multy times.
 func DelContainerForceMultyTime(c *check.C, cname string) {
 	timeout := 1 * time.Minute
-
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -305,4 +306,42 @@ func discardPullStatus(r io.ReadCloser) error {
 		}
 	}
 	return nil
+}
+
+// GetMetric get metrics from prometheus server, return total count and success count.
+func GetMetric(c *check.C, key string, keySuccess string) (int, int) {
+	resp, err := request.Get("/metrics")
+	c.Assert(err, check.IsNil)
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	value := ""
+	valueSuccess := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, key) {
+			kv := strings.Split(line, " ")
+			if len(kv) == 2 {
+				value = kv[1]
+			}
+		} else if strings.Contains(line, keySuccess) {
+			kv := strings.Split(line, " ")
+			if len(kv) == 2 {
+				valueSuccess = kv[1]
+			}
+		}
+	}
+
+	iCount := 0
+	if value != "" {
+		iCount, err = strconv.Atoi(value)
+		c.Assert(err, check.IsNil)
+	}
+
+	iCountSuccess := 0
+	if valueSuccess != "" {
+		iCountSuccess, err = strconv.Atoi(valueSuccess)
+		c.Assert(err, check.IsNil)
+	}
+
+	return iCount, iCountSuccess
 }

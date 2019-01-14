@@ -2,13 +2,11 @@ package mgr
 
 import (
 	"context"
-	"os/exec"
 	"sort"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 )
 
 //setup hooks specified by user via plugins, if set rich mode and init-script exists set init-script
@@ -50,7 +48,7 @@ func setupHook(ctx context.Context, c *Container, specWrapper *SpecWrapper) erro
 	}
 
 	// set nvidia config
-	if err := setNvidiaHook(ctx, c, specWrapper); err != nil {
+	if err := setNvidiaHook(c, specWrapper); err != nil {
 		return errors.Wrap(err, "failed to set nvidia prestart hook")
 	}
 
@@ -94,22 +92,4 @@ func (w *wrapperEmbedPrestart) Priority() int {
 
 func (w *wrapperEmbedPrestart) Hook() []string {
 	return w.args
-}
-
-func setNvidiaHook(ctx context.Context, c *Container, spec *SpecWrapper) error {
-	n := c.HostConfig.NvidiaConfig
-	if n == nil {
-		return nil
-	}
-	path, err := exec.LookPath("nvidia-container-runtime-hook")
-	if err != nil {
-		return err
-	}
-	args := []string{path}
-	nvidiaPrestart := specs.Hook{
-		Path: path,
-		Args: append(args, "prestart"),
-	}
-	spec.s.Hooks.Prestart = append(spec.s.Hooks.Prestart, nvidiaPrestart)
-	return nil
 }

@@ -4,11 +4,11 @@ import (
 	"context"
 	"path"
 
-	"github.com/alibaba/pouch/apis/plugins"
 	"github.com/alibaba/pouch/ctrd"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/events"
 	"github.com/alibaba/pouch/daemon/mgr"
+	"github.com/alibaba/pouch/hookplugins"
 	"github.com/alibaba/pouch/pkg/meta"
 )
 
@@ -21,7 +21,8 @@ type DaemonProvider interface {
 	VolMgr() mgr.VolumeMgr
 	NetMgr() mgr.NetworkMgr
 	MetaStore() *meta.Store
-	ContainerPlugin() plugins.ContainerPlugin
+	ContainerPlugin() hookplugins.ContainerPlugin
+	ImagePlugin() hookplugins.ImagePlugin
 	EventsService() *events.Events
 }
 
@@ -37,7 +38,7 @@ func GenSystemMgr(cfg *config.Config, d DaemonProvider) (mgr.SystemMgr, error) {
 
 // GenImageMgr generates a ImageMgr instance according to config cfg.
 func GenImageMgr(cfg *config.Config, d DaemonProvider) (mgr.ImageMgr, error) {
-	return mgr.NewImageManager(cfg, d.Containerd(), d.EventsService())
+	return mgr.NewImageManager(cfg, d.Containerd(), d.EventsService(), d.ImagePlugin())
 }
 
 // GenVolumeMgr generates a VolumeMgr instance according to config cfg.

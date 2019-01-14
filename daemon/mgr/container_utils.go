@@ -1,8 +1,11 @@
 package mgr
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/alibaba/pouch/pkg/meta"
 	"github.com/alibaba/pouch/pkg/randomid"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 )
@@ -50,18 +54,13 @@ func (mgr *ContainerManager) containerID(nameOrPrefix string) (string, error) {
 }
 
 func (mgr *ContainerManager) container(nameOrPrefix string) (*Container, error) {
-	res, ok := mgr.cache.Get(nameOrPrefix).Result()
-	if ok {
-		return res.(*Container), nil
-	}
-
 	id, err := mgr.containerID(nameOrPrefix)
 	if err != nil {
 		return nil, err
 	}
 
 	// lookup again
-	res, ok = mgr.cache.Get(id).Result()
+	res, ok := mgr.cache.Get(id).Result()
 	if ok {
 		return res.(*Container), nil
 	}
@@ -130,6 +129,23 @@ func (mgr *ContainerManager) getRuntime(runtime string) (string, error) {
 	return rPath, nil
 }
 
+// getContainerSpec returns container runtime spec, unmarshal spec from config.json
+// TODO: when runtime type can be specified, it need fix
+func (mgr *ContainerManager) getContainerSpec(c *Container) (*specs.Spec, error) {
+	runtimeType := fmt.Sprintf("io.containerd.runtime.v1.%s", runtime.GOOS)
+	configFile := filepath.Join(mgr.Config.HomeDir, "containerd/state", runtimeType, mgr.Config.DefaultNamespace, c.ID, "config.json")
+	var spec specs.Spec
+	data, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return nil, err
+	}
+
+	return &spec, nil
+}
+
 // BuildContainerEndpoint is used to build container's endpoint config.
 func BuildContainerEndpoint(c *Container) *networktypes.Endpoint {
 	return &networktypes.Endpoint{
@@ -174,12 +190,6 @@ func parseSecurityOpts(c *Container, securityOpts []string) error {
 			c.AppArmorProfile = value
 		case "seccomp":
 			c.SeccompProfile = value
-		case "no-new-privileges":
-			noNewPrivileges, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("invalid --security-opt: %q", securityOpt)
-			}
-			c.NoNewPrivileges = noNewPrivileges
 		case "label":
 			labelOpts = append(labelOpts, value)
 		default:

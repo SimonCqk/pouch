@@ -7,7 +7,7 @@ import (
 	"github.com/alibaba/pouch/apis/opts/config"
 	"github.com/alibaba/pouch/apis/types"
 
-	strfmt "github.com/go-openapi/strfmt"
+	"github.com/go-openapi/strfmt"
 )
 
 type container struct {
@@ -25,6 +25,7 @@ type container struct {
 	hostname            string
 	rm                  bool
 	disableNetworkFiles bool
+	specificID          string
 
 	blkioWeight          uint16
 	blkioWeightDevice    config.WeightDevice
@@ -49,6 +50,10 @@ type container struct {
 	scheLatSwitch       int64
 	oomKillDisable      bool
 
+	dns        []string
+	dnsOptions []string
+	dnsSearch  []string
+
 	devices        []string
 	enableLxcfs    bool
 	privileged     bool
@@ -60,7 +65,7 @@ type container struct {
 	networks       []string
 	ports          []string
 	expose         []string
-	publicAll      bool
+	publishAll     bool
 	securityOpt    []string
 	capAdd         []string
 	capDrop        []string
@@ -194,6 +199,7 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 			QuotaID:             c.quotaID,
 			SpecAnnotation:      specAnnotation,
 			NetPriority:         c.netPriority,
+			SpecificID:          c.specificID,
 		},
 
 		HostConfig: &types.HostConfig{
@@ -233,20 +239,24 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 				Ulimits:       c.ulimit.Value(),
 				PidsLimit:     c.pidsLimit,
 			},
-			EnableLxcfs:   c.enableLxcfs,
-			Privileged:    c.privileged,
-			RestartPolicy: restartPolicy,
-			IpcMode:       c.ipcMode,
-			PidMode:       c.pidMode,
-			UTSMode:       c.utsMode,
-			GroupAdd:      c.groupAdd,
-			Sysctls:       sysctls,
-			SecurityOpt:   c.securityOpt,
-			NetworkMode:   networkMode,
-			CapAdd:        c.capAdd,
-			CapDrop:       c.capDrop,
-			PortBindings:  portBindings,
-			OomScoreAdj:   c.oomScoreAdj,
+			DNS:             c.dns,
+			DNSOptions:      c.dnsOptions,
+			DNSSearch:       c.dnsSearch,
+			EnableLxcfs:     c.enableLxcfs,
+			Privileged:      c.privileged,
+			RestartPolicy:   restartPolicy,
+			IpcMode:         c.ipcMode,
+			PidMode:         c.pidMode,
+			UTSMode:         c.utsMode,
+			GroupAdd:        c.groupAdd,
+			Sysctls:         sysctls,
+			SecurityOpt:     c.securityOpt,
+			NetworkMode:     networkMode,
+			PublishAllPorts: c.publishAll,
+			CapAdd:          c.capAdd,
+			CapDrop:         c.capDrop,
+			PortBindings:    portBindings,
+			OomScoreAdj:     c.oomScoreAdj,
 			LogConfig: &types.LogConfig{
 				LogDriver: c.logDriver,
 				LogOpts:   logOpts,

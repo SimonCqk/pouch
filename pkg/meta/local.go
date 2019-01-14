@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -38,12 +39,9 @@ func NewLocalStore(cfg Config) (Backend, error) {
 
 	// initialize cache
 	handle := func(f os.FileInfo) error {
-		if _, err := s.Get(MetaJSONFile, f.Name()); err != nil {
-			return err
-		}
+		_, err := s.Get(MetaJSONFile, f.Name())
+		return err
 		// TODO maybe get other file.
-
-		return nil
 	}
 
 	if err := walkDir(s.base, handle); err != nil {
@@ -67,17 +65,25 @@ func (s *localStore) Put(fileName, key string, value []byte) error {
 		return err
 	}
 
+	// write new content write into a new target file, rename it to meta.json
+	// after sueecssful, avoid origin data file broken in case of some problem.
 	name := filepath.Join(dir, fileName)
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0644)
+	target := fmt.Sprintf("%s.%d", name, time.Now().Unix())
+
+	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %s, %v", name, err)
+		return fmt.Errorf("failed to open file: %s, %v", target, err)
 	}
 	defer f.Close()
 
 	if _, err := f.Write(value); err != nil {
-		return fmt.Errorf("failed to write file: %s, %v", name, err)
+		return fmt.Errorf("failed to write file: %s, %v", target, err)
 	}
 	f.Sync()
+
+	if err := os.Rename(target, name); err != nil {
+		return fmt.Errorf("failed to rename file %s to %s: %s", target, name, err)
+	}
 
 	// NOTICE: cache the key-value.
 	s.cache[key+"/"+fileName] = value
@@ -166,6 +172,11 @@ func (s *localStore) Keys(fileName string) ([]string, error) {
 	}
 
 	return keys, nil
+}
+
+// Close do nothing in local store
+func (s *localStore) Close() error {
+	return nil
 }
 
 func mkdirIfNotExist(dir string) error {

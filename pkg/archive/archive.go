@@ -50,11 +50,8 @@ func tarFromDir(src string, writer io.Writer) error {
 		defer f.Close()
 
 		// copy file data into tar writer
-		if _, err := io.Copy(tw, f); err != nil {
-			return err
-		}
-
-		return nil
+		_, err = io.Copy(tw, f)
+		return err
 	})
 }
 
@@ -107,10 +104,6 @@ func CopyWithTar(src, dst string) error {
 		return err
 	}
 
-	if err := untarToDir(dst, buf); err != nil {
-		return err
-	}
-
-	return nil
+	return untarToDir(dst, buf)
 
 }

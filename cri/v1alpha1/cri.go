@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,15 +12,18 @@ import (
 	goruntime "runtime"
 	"time"
 
+	"github.com/alibaba/pouch/apis/filters"
 	apitypes "github.com/alibaba/pouch/apis/types"
 	anno "github.com/alibaba/pouch/cri/annotations"
 	cni "github.com/alibaba/pouch/cri/ocicni"
 	"github.com/alibaba/pouch/cri/stream"
+	"github.com/alibaba/pouch/ctrd"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/mgr"
 	"github.com/alibaba/pouch/pkg/errtypes"
 	"github.com/alibaba/pouch/pkg/meta"
 	"github.com/alibaba/pouch/pkg/reference"
+	"github.com/alibaba/pouch/pkg/streams"
 	"github.com/alibaba/pouch/pkg/utils"
 	"github.com/alibaba/pouch/version"
 
@@ -60,12 +62,6 @@ const (
 
 	// resolvConfPath is the abs path of resolv.conf on host or container.
 	resolvConfPath = "/etc/resolv.conf"
-
-	// statsCollectPeriod is the time duration (in time.Second)  we sync stats from containerd.
-	statsCollectPeriod = 10
-
-	// defaultSnapshotterName is the default Snapshotter name.
-	defaultSnapshotterName = "overlayfs"
 
 	// snapshotPlugin implements a snapshotter.
 	snapshotPlugin = "io.containerd.snapshotter.v1"
@@ -164,17 +160,25 @@ func NewCriManager(config *config.Config, ctrMgr mgr.ContainerMgr, imgMgr mgr.Im
 		return nil, fmt.Errorf("failed to create sandbox meta store: %v", err)
 	}
 
-	imageFSPath := imageFSPath(path.Join(config.HomeDir, "containerd/root"), defaultSnapshotterName)
+	imageFSPath := imageFSPath(path.Join(config.HomeDir, "containerd/root"), ctrd.CurrentSnapshotterName(context.TODO()))
 	c.ImageFSUUID, err = getDeviceUUID(imageFSPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get imagefs uuid of %q: %v", imageFSPath, err)
 	}
 
-	snapshotsSyncer := ctrMgr.NewSnapshotsSyncer(
-		c.SnapshotStore,
-		time.Duration(statsCollectPeriod)*time.Second,
-	)
-	snapshotsSyncer.Start()
+	if !config.CriConfig.DisableCriStatsCollect {
+		period := config.CriConfig.CriStatsCollectPeriod
+		if period <= 0 {
+			return nil, fmt.Errorf("cri stats collect period should > 0")
+		}
+		snapshotsSyncer := ctrMgr.NewSnapshotsSyncer(
+			c.SnapshotStore,
+			time.Duration(period)*time.Second,
+		)
+		snapshotsSyncer.Start()
+	} else {
+		logrus.Infof("disable cri to collect stats from containerd periodically")
+	}
 
 	return NewCriWrapper(c), nil
 }
@@ -522,7 +526,7 @@ func (c *CriManager) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	podSandboxID := r.GetPodSandboxId()
 
 	labels := makeLabels(config.GetLabels(), config.GetAnnotations())
-	// Apply the container type lable.
+	// Apply the container type label.
 	labels[containerTypeLabelKey] = containerTypeLabelContainer
 	// Write the sandbox ID in the labels.
 	labels[sandboxIDLabelKey] = podSandboxID
@@ -597,11 +601,7 @@ func (c *CriManager) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	// Get container log.
 	if config.GetLogPath() != "" {
 		logPath := filepath.Join(sandboxConfig.GetLogDirectory(), config.GetLogPath())
-		// NOTE: If we attach log here, the IO of container will be created
-		// by this function first, so we should decide whether open the stdin
-		// here. It's weird actually, make it more elegant in the future.
-		err = c.attachLog(logPath, containerID, config.Stdin)
-		if err != nil {
+		if err := c.ContainerMgr.AttachCRILog(ctx, containerID, logPath); err != nil {
 			return nil, err
 		}
 	}
@@ -822,6 +822,20 @@ func (c *CriManager) ContainerStats(ctx context.Context, r *runtime.ContainerSta
 func (c *CriManager) ListContainerStats(ctx context.Context, r *runtime.ListContainerStatsRequest) (*runtime.ListContainerStatsResponse, error) {
 	opts := &mgr.ContainerListOption{All: true}
 	filter := func(c *mgr.Container) bool {
+		if c.Config.Labels[containerTypeLabelKey] != containerTypeLabelContainer {
+			return false
+		}
+
+		if r.GetFilter().GetId() != "" && c.ID != r.GetFilter().GetId() {
+			return false
+		}
+		if r.GetFilter().GetPodSandboxId() != "" && c.Config.Labels[sandboxIDLabelKey] != r.GetFilter().GetPodSandboxId() {
+			return false
+		}
+		if r.GetFilter().GetLabelSelector() != nil &&
+			!utils.MatchLabelSelector(r.GetFilter().GetLabelSelector(), c.Config.Labels) {
+			return false
+		}
 		return true
 	}
 	opts.FilterFunc = filter
@@ -835,7 +849,7 @@ func (c *CriManager) ListContainerStats(ctx context.Context, r *runtime.ListCont
 	for _, container := range containers {
 		cs, err := c.getContainerMetrics(ctx, container)
 		if err != nil {
-			logrus.Errorf("failed to decode metrics of container %q: %v", container.ID, err)
+			logrus.Warnf("failed to decode metrics of container %q: %v", container.ID, err)
 			continue
 		}
 
@@ -885,60 +899,37 @@ func (c *CriManager) ExecSync(ctx context.Context, r *runtime.ExecSyncRequest) (
 	defer cancel()
 
 	createConfig := &apitypes.ExecCreateConfig{
-		Cmd: r.GetCmd(),
+		Cmd:          r.GetCmd(),
+		AttachStdout: true,
+		AttachStderr: true,
 	}
+
 	execid, err := c.ContainerMgr.CreateExec(ctx, id, createConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create exec for container %q: %v", id, err)
 	}
 
-	reader, writer := io.Pipe()
-	defer writer.Close()
-
-	attachConfig := &mgr.AttachConfig{
-		Stdout:      true,
-		Stderr:      true,
-		Pipe:        writer,
-		MuxDisabled: true,
+	stdoutBuf, stderrBuf := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+	attachCfg := &streams.AttachConfig{
+		UseStdout: true,
+		Stdout:    stdoutBuf,
+		UseStderr: true,
+		Stderr:    stderrBuf,
 	}
-
-	err = c.ContainerMgr.StartExec(ctx, execid, attachConfig)
-	if err != nil {
+	if err := c.ContainerMgr.StartExec(ctx, execid, attachCfg); err != nil {
 		return nil, fmt.Errorf("failed to start exec for container %q: %v", id, err)
 	}
 
-	readWaitCh := make(chan error, 1)
-	var recv bytes.Buffer
-	go func() {
-		defer reader.Close()
-		_, err = io.Copy(&recv, reader)
-		readWaitCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		//TODO maybe stop the execution?
-		return nil, fmt.Errorf("timeout %v exceeded", timeout)
-	case readWaitErr := <-readWaitCh:
-		if readWaitErr != nil {
-			return nil, fmt.Errorf("failed to read data from the pipe: %v", err)
-		}
-		execConfig, err := c.ContainerMgr.GetExecConfig(ctx, execid)
-		if err != nil {
-			return nil, fmt.Errorf("failed to inspect exec for container %q: %v", id, err)
-		}
-
-		var stderr []byte
-		if execConfig.Error != nil {
-			stderr = []byte(execConfig.Error.Error())
-		}
-
-		return &runtime.ExecSyncResponse{
-			Stdout:   recv.Bytes(),
-			Stderr:   stderr,
-			ExitCode: int32(execConfig.ExitCode),
-		}, nil
+	execConfig, err := c.ContainerMgr.GetExecConfig(ctx, execid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect exec for container %q: %v", id, err)
 	}
+
+	return &runtime.ExecSyncResponse{
+		Stdout:   stdoutBuf.Bytes(),
+		Stderr:   stderrBuf.Bytes(),
+		ExitCode: int32(execConfig.ExitCode),
+	}, nil
 }
 
 // Exec prepares a streaming endpoint to execute a command in the container, and returns the address.
@@ -1003,7 +994,7 @@ func (c *CriManager) Status(ctx context.Context, r *runtime.StatusRequest) (*run
 // ListImages lists existing images.
 func (c *CriManager) ListImages(ctx context.Context, r *runtime.ListImagesRequest) (*runtime.ListImagesResponse, error) {
 	// TODO: handle image list filters.
-	imageList, err := c.ImageMgr.ListImages(ctx, "")
+	imageList, err := c.ImageMgr.ListImages(ctx, filters.NewArgs())
 	if err != nil {
 		return nil, err
 	}

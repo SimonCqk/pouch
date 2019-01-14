@@ -3,6 +3,7 @@ pouchd
 pouch
 *.patch
 volume_build.go
+hook_plugins_build.go
 coverage.txt
 .*.swp
 .*.swo
@@ -12,3 +13,4 @@ coverage.txt
 .DS_Store
 bin/
 coverage/
+install/

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/gotestyourself/gotestyourself/icmd"
 )
 
 // WaitTimeout wait at most timeout nanoseconds,
@@ -28,7 +30,7 @@ func WaitTimeout(timeout time.Duration, condition func() bool) bool {
 			fmt.Printf("condition failed to return true within %f seconds.\n", timeout.Seconds())
 			return false
 		case <-ticker.C:
-			if condition() == true {
+			if condition() {
 				ch <- true
 			}
 		}
@@ -53,4 +55,28 @@ func TrimAllSpaceAndNewline(input string) string {
 	}
 
 	return output
+}
+
+// GetMajMinNumOfDevice is used for getting major:minor device number
+func GetMajMinNumOfDevice(device string) (string, bool) {
+	cmd := fmt.Sprintf("lsblk -d -o MAJ:MIN %s | sed /MAJ:MIN/d | awk '{print $1}'", device)
+	number := icmd.RunCommand("bash", "-c", cmd).Stdout()
+	if number != "" {
+		return strings.Trim(number, "\n"), true
+	}
+	return "", false
+}
+
+// StringSliceTrimSpace delete empty items from string slice
+func StringSliceTrimSpace(input []string) ([]string, error) {
+	output := []string{}
+
+	for _, item := range input {
+		str := strings.TrimSpace(item)
+		if str != "" {
+			output = append(output, str)
+		}
+	}
+
+	return output, nil
 }

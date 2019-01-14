@@ -2,19 +2,19 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
-	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/test/command"
 	"github.com/alibaba/pouch/test/environment"
 
 	"github.com/go-check/check"
 	"github.com/gotestyourself/gotestyourself/icmd"
 	"github.com/kr/pty"
+	"github.com/stretchr/testify/assert"
 )
 
 // PouchStartSuite is the test suite for start CLI.
@@ -46,7 +46,7 @@ func (suite *PouchStartSuite) TestStartCommand(c *check.C) {
 
 	command.PouchRun("start", name).Assert(c, icmd.Success)
 
-	command.PouchRun("stop", name).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", name).Assert(c, icmd.Success)
 }
 
 // TestStartInTTY tests "pouch start -i" work.
@@ -74,7 +74,7 @@ func (suite *PouchStartSuite) TestStartInTTY(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Assert(strings.TrimSpace(echo), check.Equals, msg)
 
-	command.PouchRun("stop", name)
+	command.PouchRun("stop", "-t", "1", name)
 }
 
 // TestStartInWrongWay runs start command in wrong way.
@@ -106,7 +106,7 @@ func (suite *PouchStartSuite) TestStartWithEnv(c *check.C) {
 		c.Errorf("failed to set env: %s, %s", env, output)
 	}
 
-	command.PouchRun("stop", name).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", name).Assert(c, icmd.Success)
 }
 
 // TestStartWithEntrypoint starts a container with  entrypoint.
@@ -172,7 +172,7 @@ func (suite *PouchStartSuite) TestStartWithHostname(c *check.C) {
 		c.Errorf("failed to set hostname: %s, %s", hostname, output)
 	}
 
-	command.PouchRun("stop", name).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", name).Assert(c, icmd.Success)
 }
 
 // TestStartWithSysctls starts a container with sysctls.
@@ -189,7 +189,7 @@ func (suite *PouchStartSuite) TestStartWithSysctls(c *check.C) {
 		c.Errorf("failed to start a container with sysctls: %s", output)
 	}
 
-	command.PouchRun("stop", name).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", name).Assert(c, icmd.Success)
 }
 
 // TestStartWithAppArmor starts a container with security option AppArmor.
@@ -204,7 +204,7 @@ func (suite *PouchStartSuite) TestStartWithAppArmor(c *check.C) {
 
 	// TODO: do the test more strictly with effective AppArmor profile.
 
-	command.PouchRun("stop", name).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", name).Assert(c, icmd.Success)
 }
 
 // TestStartWithSeccomp starts a container with security option seccomp.
@@ -219,7 +219,7 @@ func (suite *PouchStartSuite) TestStartWithSeccomp(c *check.C) {
 
 	// TODO: do the test more strictly with effective seccomp profile.
 
-	command.PouchRun("stop", name).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", name).Assert(c, icmd.Success)
 }
 
 // TestStartWithCapability starts a container with capability.
@@ -269,12 +269,9 @@ func (suite *PouchStartSuite) TestStartWithExitCode(c *check.C) {
 	ret.Assert(c, icmd.Expected{ExitCode: 101})
 
 	// test container ExitCode == 101
-	output := command.PouchRun("inspect", name).Stdout()
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].State.ExitCode, check.Equals, int64(101))
+	exitCode, err := inspectFilter(name, ".State.ExitCode")
+	c.Assert(err, check.IsNil)
+	c.Assert(exitCode, check.Equals, "101")
 }
 
 // TestStartWithUlimit starts a container with --ulimit.
@@ -313,15 +310,39 @@ func (suite *PouchStartSuite) TestStartFromCheckpoint(c *check.C) {
 	defer os.RemoveAll(tmpDir)
 	checkpoint := "cp0"
 	command.PouchRun("checkpoint", "create", "--checkpoint-dir", tmpDir, name, checkpoint).Assert(c, icmd.Success)
+	// check criu image files have been dumped into checkpoint-dir, pouch create a description json,
+	// so there should be more than 1 files
+	dirs, err := ioutil.ReadDir(filepath.Join(tmpDir, checkpoint))
+	c.Assert(err, check.IsNil)
+	if len(dirs) < 2 {
+		c.Errorf("failed to dump criu image for container %s", name)
+	}
 
 	restoredContainer := "restoredContainer"
 	defer DelContainerForceMultyTime(c, restoredContainer)
 	// image busybox not have /proc directory, we need to start busybox image and stop it
 	// make /proc exist, then we can restore successful
 	command.PouchRun("run", "-d", "--name", restoredContainer, busyboxImage).Assert(c, icmd.Success)
-	command.PouchRun("stop", restoredContainer).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", restoredContainer).Assert(c, icmd.Success)
 
 	command.PouchRun("start", "--checkpoint-dir", tmpDir, "--checkpoint", checkpoint, restoredContainer).Assert(c, icmd.Success)
+
+	result := command.PouchRun("exec", restoredContainer, "sh", "-c", "ps -ef | grep top").Assert(c, icmd.Success)
+	if !strings.Contains(result.Stdout(), "top") {
+		c.Error("restored container should have top process")
+	}
+}
+
+// TestStartWithTty tests running container with -tty flag and attach stdin in a non-tty client.
+func (suite *PouchStartSuite) TestStartWithTty(c *check.C) {
+	name := "TestStartWithTty"
+	res := command.PouchRun("create", "-t", "--name", name, busyboxImage, "/bin/sh", "-c", "while true;do echo hello;done")
+	defer DelContainerForceMultyTime(c, name)
+	res.Assert(c, icmd.Success)
+
+	attachRes := command.PouchRun("start", "-a", "-i", name)
+	errString := attachRes.Stderr()
+	assert.Equal(c, errString, "Error: the input device is not a TTY\n")
 }
 
 // TestStartMultiContainers tries to start more than one container.
@@ -336,6 +357,16 @@ func (suite *PouchStartSuite) TestStartMultiContainers(c *check.C) {
 	res := command.PouchRun("start", containernames[0], containernames[1])
 	res.Assert(c, icmd.Success)
 
-	res = command.PouchRun("stop", containernames[0], containernames[1])
+	res = command.PouchRun("stop", "-t", "1", containernames[0], containernames[1])
 	res.Assert(c, icmd.Success)
+}
+
+// TestStartContainerTwice tries to start a container twice
+func (suite *PouchStartSuite) TestStartContainerTwice(c *check.C) {
+	name := "TestStartContainerTwice"
+	defer DelContainerForceMultyTime(c, name)
+
+	command.PouchRun("create", "--name", name, busyboxImage, "top").Assert(c, icmd.Success)
+	command.PouchRun("start", name).Assert(c, icmd.Success)
+	command.PouchRun("start", name).Assert(c, icmd.Success)
 }

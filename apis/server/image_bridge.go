@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alibaba/pouch/apis/filters"
 	"github.com/alibaba/pouch/apis/metrics"
 	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/daemon/mgr"
 	"github.com/alibaba/pouch/pkg/httputils"
+	util_metrics "github.com/alibaba/pouch/pkg/utils/metrics"
 
 	"github.com/gorilla/mux"
 	"github.com/opencontainers/go-digest"
@@ -34,9 +36,13 @@ func (s *Server) pullImage(ctx context.Context, rw http.ResponseWriter, req *htt
 		image = image + ":" + tag
 	}
 
+	label := util_metrics.ActionPullLabel
+
 	// record the time spent during image pull procedure.
 	defer func(start time.Time) {
-		metrics.ImagePullSummary.WithLabelValues(image).Observe(metrics.SinceInMicroseconds(start))
+		metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+		metrics.ImagePullSummary.WithLabelValues(image).Observe(util_metrics.SinceInMicroseconds(start))
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
 	// get registry auth from Request header
@@ -53,6 +59,7 @@ func (s *Server) pullImage(ctx context.Context, rw http.ResponseWriter, req *htt
 		logrus.Errorf("failed to pull image %s: %v", image, err)
 		return nil
 	}
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
 	return nil
 }
 
@@ -69,9 +76,12 @@ func (s *Server) getImage(ctx context.Context, rw http.ResponseWriter, req *http
 }
 
 func (s *Server) listImages(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
-	filters := req.FormValue("filters")
+	filter, err := filters.FromParam(req.FormValue("filters"))
+	if err != nil {
+		return err
+	}
 
-	imageList, err := s.ImageMgr.ListImages(ctx, filters)
+	imageList, err := s.ImageMgr.ListImages(ctx, filter)
 	if err != nil {
 		logrus.Errorf("failed to list images: %v", err)
 		return err
@@ -85,7 +95,7 @@ func (s *Server) searchImages(ctx context.Context, rw http.ResponseWriter, req *
 
 	searchResultItem, err := s.ImageMgr.SearchImages(ctx, searchPattern, registry)
 	if err != nil {
-		logrus.Errorf("failed to search images from resgitry: %v", err)
+		logrus.Errorf("failed to search images from registry: %v", err)
 		return err
 	}
 	return EncodeResponse(rw, http.StatusOK, searchResultItem)
@@ -104,6 +114,12 @@ func (s *Server) removeImage(ctx context.Context, rw http.ResponseWriter, req *h
 	if err != nil {
 		return err
 	}
+
+	label := util_metrics.ActionDeleteLabel
+	defer func(start time.Time) {
+		metrics.ImageActionsCounter.WithLabelValues(label).Inc()
+		metrics.ImageActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}(time.Now())
 
 	isForce := httputils.BoolValue(req, "force")
 	// We only should check the image whether used by container when there is only one primary reference.
@@ -126,6 +142,7 @@ func (s *Server) removeImage(ctx context.Context, rw http.ResponseWriter, req *h
 		return err
 	}
 
+	metrics.ImageSuccessActionsCounter.WithLabelValues(label).Inc()
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
 }
@@ -175,11 +192,8 @@ func (s *Server) saveImage(ctx context.Context, rw http.ResponseWriter, req *htt
 	defer r.Close()
 
 	output := newWriteFlusher(rw)
-	if _, err := io.Copy(output, r); err != nil {
-		return err
-	}
-
-	return nil
+	_, err = io.Copy(output, r)
+	return err
 }
 
 // getImageHistory gets image history.

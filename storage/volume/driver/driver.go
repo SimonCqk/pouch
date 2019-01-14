@@ -6,7 +6,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/alibaba/pouch/plugins"
+	"github.com/alibaba/pouch/storage/plugins"
 	"github.com/pkg/errors"
 )
 
@@ -49,18 +49,12 @@ func (m VolumeStoreMode) Valid() bool {
 
 	// local store
 	if m.IsLocal() {
-		if m.CentralCreateDelete() {
-			return false
-		}
-		return true
+		return !m.CentralCreateDelete()
 	}
 
 	// remote store
 	if m.IsRemote() {
-		if m.UseLocalMeta() {
-			return false
-		}
-		return true
+		return !m.UseLocalMeta()
 	}
 
 	return false
@@ -138,13 +132,13 @@ func (t *driverTable) GetAll() ([]Driver, error) {
 	}
 
 	for _, p := range pluginList {
-		d, ok := t.drivers[p.Name]
+		_, ok := t.drivers[p.Name]
 		if ok {
 			// the driver has existed, ignore it.
 			continue
 		}
 
-		d = NewRemoteDriverWrapper(p.Name, p)
+		d := NewRemoteDriverWrapper(p.Name, p)
 
 		t.drivers[p.Name] = d
 		driverList = append(driverList, d)
@@ -225,11 +219,7 @@ func GetAll() ([]Driver, error) {
 // Exist return true if the backend driver is registered.
 func Exist(name string) bool {
 	_, err := Get(name)
-	if err != nil {
-		return false
-	}
-
-	return true
+	return err == nil
 }
 
 // AllDriversName return all registered backend driver's name.

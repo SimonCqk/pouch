@@ -1,16 +1,20 @@
 package mgr
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/daemon/logger"
+	"github.com/alibaba/pouch/daemon/logger/jsonfile"
 	"github.com/alibaba/pouch/daemon/logger/syslog"
 	"github.com/alibaba/pouch/pkg/system"
+	"github.com/alibaba/pouch/pkg/utils"
 
+	"github.com/docker/go-units"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -26,10 +30,21 @@ var (
 
 	errInvalidDevice = errors.New("invalid nvidia device")
 	errInvalidDriver = errors.New("invalid nvidia driver capability")
+
+	// commonLogOpts the option which should be validated in common such as mode, max-buffer-size.
+	commonLogOpts = map[string]bool{
+		"mode":            true,
+		"max-buffer-size": true,
+	}
 )
 
 // validateConfig validates container config
 func (mgr *ContainerManager) validateConfig(c *Container, update bool) ([]string, error) {
+	// validates rich mode
+	if err := validateRichMode(c); err != nil {
+		return nil, err
+	}
+
 	// validates container hostconfig
 	hostConfig := c.HostConfig
 	warnings := make([]string, 0)
@@ -56,8 +71,53 @@ func (mgr *ContainerManager) validateConfig(c *Container, update bool) ([]string
 		return warnings, err
 	}
 
-	// TODO: validate config
+	// validate seccomp, apparmor security parameters
+	sysInfo := system.NewInfo()
+	if !sysInfo.Seccomp {
+		if c.SeccompProfile != "" || c.SeccompProfile != ProfileUnconfined {
+			warnings = append(warnings, fmt.Sprintf("Current Kernel does not support seccomp, discard --security-opt seccomp=%s", c.SeccompProfile))
+		}
+		// always set SeccompProfile to unconfined if kernel not support seccomp
+		c.SeccompProfile = ProfileUnconfined
+
+	}
+	if !sysInfo.AppArmor {
+		if c.AppArmorProfile != "" {
+			warnings = append(warnings, fmt.Sprintf("Current Kernel does not support apparmor, discard --security-opt apparmor=%s", c.AppArmorProfile))
+		}
+		c.AppArmorProfile = ""
+	}
+
 	return warnings, nil
+}
+
+// validateRichMode verifies rich mode parameters
+func validateRichMode(c *Container) error {
+	richModes := []string{
+		types.ContainerConfigRichModeDumbInit,
+		types.ContainerConfigRichModeSbinInit,
+		types.ContainerConfigRichModeSystemd,
+	}
+
+	if !c.Config.Rich && c.Config.RichMode != "" {
+		return fmt.Errorf("must first enable rich mode, then specify a rich mode type")
+	}
+	// check rich mode
+	if c.Config.RichMode != "" && !utils.StringInSlice(richModes, c.Config.RichMode) {
+		return fmt.Errorf("not supported rich mode: %v", c.Config.RichMode)
+	}
+
+	// must use privileged when use systemd rich mode
+	if c.Config.RichMode == types.ContainerConfigRichModeSystemd && !c.HostConfig.Privileged {
+		return fmt.Errorf("must using privileged mode when create systemd rich container")
+	}
+
+	// if enables rich mode but not specified rich mode type, assign to dumb-init
+	if c.Config.Rich && c.Config.RichMode == "" {
+		c.Config.RichMode = types.ContainerConfigRichModeDumbInit
+	}
+
+	return nil
 }
 
 // validateResource verifies cgroup resources
@@ -101,7 +161,7 @@ func validateResource(r *types.Resources, update bool) ([]string, error) {
 			r.MemorySwappiness = nil
 		}
 		if r.MemorySwappiness != nil && *r.MemorySwappiness != -1 && (*r.MemorySwappiness < 0 || *r.MemorySwappiness > 100) {
-			return warnings, fmt.Errorf("MemorySwappiness should in range [0, 100]")
+			return warnings, fmt.Errorf("MemorySwappiness should in range [0, 100] or -1 as a legacy alias of 0")
 		}
 		if r.OomKillDisable != nil && !cgroupInfo.Memory.OOMKillDisable {
 			logrus.Warn(OOMKillWarn)
@@ -200,9 +260,37 @@ func (mgr *ContainerManager) validateLogConfig(c *Container) error {
 		return nil
 	}
 
+	// validate log mode
+	switch logger.LogMode(logCfg.LogOpts["mode"]) {
+	case logger.LogModeDefault, logger.LogModeBlocking, logger.LogModeNonBlock:
+	default:
+		return fmt.Errorf("unsupported logger mode: %s", logCfg.LogOpts["mode"])
+	}
+
+	// validate max buffer size of logger
+	if maxBufferSize, ok := logCfg.LogOpts["max-buffer-size"]; ok {
+		if logger.LogMode(logCfg.LogOpts["mode"]) != logger.LogModeNonBlock {
+			return fmt.Errorf("max-buffer-size option is only supported with 'mode=%s'", logger.LogModeNonBlock)
+		}
+
+		// try to parse the max-buffer-size option
+		_, err := units.RAMInBytes(maxBufferSize)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse option max-buffer-size: %s", maxBufferSize)
+		}
+	}
+
+	// filter the option which have been validated in common.
+	restOpts := make(map[string]string)
+	for k, v := range logCfg.LogOpts {
+		if !commonLogOpts[k] {
+			restOpts[k] = v
+		}
+	}
+
 	switch logCfg.LogDriver {
 	case types.LogConfigLogDriverNone, types.LogConfigLogDriverJSONFile:
-		return nil
+		return jsonfile.ValidateLogOpt(restOpts)
 	case types.LogConfigLogDriverSyslog:
 		info := mgr.convContainerToLoggerInfo(c)
 		return syslog.ValidateSyslogOption(info)
@@ -221,11 +309,7 @@ func validateNvidiaConfig(r *types.Resources) error {
 		return err
 	}
 
-	if err := validateNvidiaDevice(r); err != nil {
-		return err
-	}
-
-	return nil
+	return validateNvidiaDevice(r)
 }
 
 func validateNvidiaDriver(r *types.Resources) error {

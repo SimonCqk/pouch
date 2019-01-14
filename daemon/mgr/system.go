@@ -10,6 +10,7 @@ import (
 
 	"github.com/alibaba/pouch/apis/filters"
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/ctrd"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/events"
 	"github.com/alibaba/pouch/pkg/errtypes"
@@ -20,8 +21,16 @@ import (
 	volumedriver "github.com/alibaba/pouch/storage/volume/driver"
 	"github.com/alibaba/pouch/version"
 
+	"github.com/opencontainers/runc/libcontainer/apparmor"
+	selinux "github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	unknownHostName      = "<unknown>"
+	unknownKernelVersion = "<unknown>"
+	unknownOSName        = "<unknown>"
 )
 
 //SystemMgr as an interface defines all operations against host.
@@ -59,7 +68,7 @@ func NewSystemManager(cfg *config.Config, store *meta.Store, imageManager ImageM
 
 // Info shows system information of daemon.
 func (mgr *SystemManager) Info() (types.SystemInfo, error) {
-	kernelVersion := "<unknown>"
+	kernelVersion := unknownKernelVersion
 	if kv, err := kernel.GetKernelVersion(); err != nil {
 		logrus.Warnf("Could not get kernel version: %v", err)
 	} else {
@@ -85,7 +94,7 @@ func (mgr *SystemManager) Info() (types.SystemInfo, error) {
 		return nil
 	})
 
-	hostname := "<unknown>"
+	hostname := unknownHostName
 	if name, err := os.Hostname(); err != nil {
 		logrus.Warnf("failed to get hostname: %v", err)
 	} else {
@@ -99,18 +108,31 @@ func (mgr *SystemManager) Info() (types.SystemInfo, error) {
 		totalMem = int64(mem)
 	}
 
-	OSName := "<unknown>"
+	OSName := unknownOSName
 	if osName, err := system.GetOSName(); err != nil {
 		logrus.Warnf("failed to get operating system: %v", err)
 	} else {
 		OSName = osName
 	}
 
-	images, err := mgr.imageMgr.ListImages(context.Background(), "")
+	images, err := mgr.imageMgr.ListImages(context.Background(), filters.NewArgs())
 	if err != nil {
 		logrus.Warnf("failed to get image info: %v", err)
 	}
 	volumeDrivers := volumedriver.AllDriversName()
+
+	// security options get four part, seccomp, apparmor, selinux and userns
+	securityOpts := []string{}
+	sysInfo := system.NewInfo()
+	if sysInfo.Seccomp && IsSeccompEnable() {
+		securityOpts = append(securityOpts, "seccomp")
+	}
+	if sysInfo.AppArmor && apparmor.IsEnabled() {
+		securityOpts = append(securityOpts, "apparmor")
+	}
+	if selinux.GetEnabled() {
+		securityOpts = append(securityOpts, "selinux")
+	}
 
 	info := types.SystemInfo{
 		Architecture: runtime.GOARCH,
@@ -122,8 +144,7 @@ func (mgr *SystemManager) Info() (types.SystemInfo, error) {
 		ContainersStopped: cStopped,
 		Debug:             mgr.config.Debug,
 		DefaultRuntime:    mgr.config.DefaultRuntime,
-		// FIXME: avoid hard code
-		Driver: "overlayfs",
+		Driver:            ctrd.CurrentSnapshotterName(context.TODO()),
 		// DriverStatus: ,
 		ExperimentalBuild: false,
 		HTTPProxy:         mgr.config.ImageProxy,
@@ -148,8 +169,8 @@ func (mgr *SystemManager) Info() (types.SystemInfo, error) {
 		PouchRootDir:       mgr.config.HomeDir,
 		RegistryConfig:     &mgr.config.RegistryService,
 		// RuncCommit: ,
-		Runtimes: mgr.config.Runtimes,
-		// SecurityOptions: ,
+		Runtimes:        mgr.config.Runtimes,
+		SecurityOptions: securityOpts,
 		ServerVersion:   version.Version,
 		ListenAddresses: mgr.config.Listen,
 	}
@@ -166,7 +187,7 @@ func (mgr *SystemManager) SubscribeToEvents(ctx context.Context, since, until ti
 
 // Version shows version of daemon.
 func (mgr *SystemManager) Version() (types.SystemVersion, error) {
-	kernelVersion := "<unknown>"
+	kernelVersion := unknownKernelVersion
 	if kv, err := kernel.GetKernelVersion(); err != nil {
 		logrus.Warnf("Could not get kernel version: %v", err)
 	} else {

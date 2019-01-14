@@ -45,9 +45,6 @@ type Config struct {
 	// Server listening address.
 	Listen []string `json:"listen,omitempty"`
 
-	// ListenCRI is the listening address which serves CRI.
-	ListenCRI string `json:"listen-cri,omitempty"`
-
 	// Debug refers to the log mode.
 	Debug bool `json:"debug,omitempty"`
 
@@ -94,9 +91,6 @@ type Config struct {
 	// CgroupParent is to set parent cgroup for all containers
 	CgroupParent string `json:"cgroup-parent,omitempty"`
 
-	// PluginPath is set the path where plugin so file put
-	PluginPath string `json:"plugin,omitempty"`
-
 	// Labels is the metadata of daemon
 	Labels []string `json:"label,omitempty"`
 
@@ -120,6 +114,12 @@ type Config struct {
 
 	// DefaultNamespace is passed to containerd.
 	DefaultNamespace string `json:"default-namespace,omitempty"`
+
+	// Snapshotter is passed to containerd, default to overlayfs
+	Snapshotter string `json:"snapshotter,omitempty"`
+
+	// AllowMultiSnapshotter allows multi snapshotter, default false
+	AllowMultiSnapshotter bool `json:"allow-multi-snapshotter,omitempty"`
 }
 
 // GetCgroupDriver gets cgroup driver used in runc.
@@ -169,6 +169,7 @@ func (cfg *Config) MergeConfigurations(flagSet *pflag.FlagSet) error {
 	contents, err := ioutil.ReadFile(cfg.ConfigFile)
 	if err != nil {
 		if os.IsNotExist(err) {
+			logrus.Debugf("the %v doesn't exist: %v", cfg.ConfigFile, err)
 			return nil
 		}
 		return fmt.Errorf("failed to read contents from config file %s: %s", cfg.ConfigFile, err)
@@ -182,7 +183,7 @@ func (cfg *Config) MergeConfigurations(flagSet *pflag.FlagSet) error {
 		return nil
 	}
 
-	fileFlags := make(map[string]interface{}, 0)
+	fileFlags := make(map[string]interface{})
 	flattenConfig(origin, fileFlags)
 
 	// check conflict in command line flags and config file

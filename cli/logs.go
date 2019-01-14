@@ -11,11 +11,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var validDrivers = map[string]bool{
-	"json-file": true,
-	"journald":  true,
-}
-
 // logsDescription is used to describe logs command in detail and auto generate command doc.
 var logsDescription = "Get container's logs"
 
@@ -54,8 +49,7 @@ func (lc *LogsCommand) addFlags() {
 	flagSet.StringVarP(&lc.until, "until", "", "", "Show logs before timestamp (e.g. 2013-01-02T13:23:37) or relative (e.g. 42m for 42 minutes)")
 	flagSet.StringVarP(&lc.tail, "tail", "", "all", "Number of lines to show from the end of the logs default \"all\"")
 	flagSet.BoolVarP(&lc.timestamps, "timestamps", "t", false, "Show timestamps")
-
-	// TODO(fuwei): support the detail functionality
+	flagSet.BoolVar(&lc.details, "details", false, "Show extra details provided to logs")
 }
 
 // runLogs is the entry of LogsCommand command.
@@ -73,6 +67,7 @@ func (lc *LogsCommand) runLogs(args []string) error {
 		Timestamps: lc.timestamps,
 		Follow:     lc.follow,
 		Tail:       lc.tail,
+		Details:    lc.details,
 	}
 
 	body, err := apiClient.ContainerLogs(ctx, containerName, opts)

@@ -20,15 +20,60 @@ func TestCheckBind(t *testing.T) {
 	}
 
 	parseds := []parsed{
-		{bind: "volume-test:/mnt", len: 2, err: false, expectErr: fmt.Errorf("")},
-		{bind: "volume-test:/mnt:rw", len: 3, err: false, expectErr: fmt.Errorf("")},
-		{bind: "/mnt", len: 1, err: false, expectErr: fmt.Errorf("")},
-		{bind: ":/mnt:rw", len: 3, err: false, expectErr: fmt.Errorf(":/mnt:rw")},
-		{bind: "volume-test:/mnt:/mnt:rw", len: 4, err: true, expectErr: fmt.Errorf("unknown volume bind: volume-test:/mnt:/mnt:rw")},
-		{bind: "", len: 0, err: true, expectErr: fmt.Errorf("unknown volume bind: ")},
-		{bind: "volume-test::rw", len: 3, err: true, expectErr: fmt.Errorf("unknown volume bind: volume-test::rw")},
-		{bind: "volume-test", len: 1, err: true, expectErr: fmt.Errorf("invalid bind path: volume-test")},
-		{bind: ":mnt:rw", len: 3, err: true, expectErr: fmt.Errorf("invalid bind path: mnt")},
+		{
+			bind:      "volume-test:/mnt",
+			len:       2,
+			err:       false,
+			expectErr: fmt.Errorf(""),
+		},
+		{
+			bind:      "volume-test:/mnt:rw",
+			len:       3,
+			err:       false,
+			expectErr: fmt.Errorf(""),
+		},
+		{
+			bind:      "/mnt",
+			len:       1,
+			err:       false,
+			expectErr: fmt.Errorf(""),
+		},
+		{
+			bind:      ":/mnt:rw",
+			len:       3,
+			err:       false,
+			expectErr: fmt.Errorf(":/mnt:rw"),
+		},
+		{
+			bind:      "volume-test:/mnt:/mnt:rw",
+			len:       4,
+			err:       true,
+			expectErr: fmt.Errorf("unknown volume bind: volume-test:/mnt:/mnt:rw"),
+		},
+		{
+			bind:      "",
+			len:       0,
+			err:       true,
+			expectErr: fmt.Errorf("unknown volume bind: "),
+		},
+		{
+			bind:      "volume-test::rw",
+			len:       3,
+			err:       true,
+			expectErr: fmt.Errorf("unknown volume bind: volume-test::rw"),
+		},
+		{
+			bind:      "volume-test",
+			len:       1,
+			err:       true,
+			expectErr: fmt.Errorf("invalid bind path: volume-test"),
+		},
+		{
+			bind:      ":mnt:rw",
+			len:       3,
+			err:       true,
+			expectErr: fmt.Errorf("invalid bind path: mnt"),
+		},
 	}
 
 	for _, p := range parseds {
@@ -53,12 +98,87 @@ func TestParseBindMode(t *testing.T) {
 	}
 
 	parseds := []parsed{
-		{mode: "dr", expectMountPoint: &types.MountPoint{Mode: "dr", RW: true, CopyData: true}, err: false, expectErr: nil},
-		{mode: "nocopy", expectMountPoint: &types.MountPoint{Mode: "nocopy", RW: true, CopyData: false}, err: false, expectErr: nil},
-		{mode: "ro", expectMountPoint: &types.MountPoint{Mode: "ro", RW: false, CopyData: true}, err: false, expectErr: nil},
-		{mode: "", expectMountPoint: &types.MountPoint{Mode: "", RW: true, CopyData: true}, err: false, expectErr: nil},
-		{mode: "dr,rr", err: true, expectErr: fmt.Errorf("invalid bind mode: dr,rr")},
-		{mode: "unknown", err: true, expectErr: fmt.Errorf("unknown bind mode: unknown")},
+		{
+			mode: "dr",
+			expectMountPoint: &types.MountPoint{
+				Mode:     "dr",
+				RW:       true,
+				CopyData: true,
+			},
+			err:       false,
+			expectErr: nil,
+		},
+		{
+			mode: "private",
+			expectMountPoint: &types.MountPoint{
+				Mode:        "private",
+				Propagation: "private",
+				RW:          true,
+				CopyData:    true,
+			},
+			err:       false,
+			expectErr: nil,
+		},
+		{
+			mode: "nocopy",
+			expectMountPoint: &types.MountPoint{
+				Mode:     "nocopy",
+				RW:       true,
+				CopyData: false,
+			},
+			err:       false,
+			expectErr: nil,
+		},
+		{
+			mode: "ro",
+			expectMountPoint: &types.MountPoint{
+				Mode:     "ro",
+				RW:       false,
+				CopyData: true,
+			},
+			err:       false,
+			expectErr: nil,
+		},
+		{
+			mode: "",
+			expectMountPoint: &types.MountPoint{
+				Mode:     "",
+				RW:       true,
+				CopyData: true,
+			},
+			err:       false,
+			expectErr: nil,
+		},
+		{
+			mode:      "dr,rr",
+			err:       true,
+			expectErr: fmt.Errorf("invalid bind mode: dr,rr"),
+		},
+		{
+			mode:      "unknown",
+			err:       true,
+			expectErr: fmt.Errorf("unknown bind mode: unknown"),
+		},
+		{
+			mode: "rw",
+			expectMountPoint: &types.MountPoint{
+				Mode:     "rw",
+				RW:       true,
+				CopyData: true,
+			},
+			err:       false,
+			expectErr: nil,
+		},
+		{
+			mode: "z,Z",
+			expectMountPoint: &types.MountPoint{
+				Mode:     "z,Z",
+				RW:       true,
+				CopyData: true,
+			},
+			err:       false,
+			expectErr: nil,
+		},
 	}
 
 	for _, p := range parseds {
@@ -87,11 +207,41 @@ func TestParseVolumesFrom(t *testing.T) {
 	}
 
 	parseds := []parsed{
-		{volumesFrom: "123456789", expectID: "123456789", expectMode: "", err: false, expectErr: nil},
-		{volumesFrom: "123456789:nocopy", expectID: "123456789", expectMode: "nocopy", err: false, expectErr: nil},
-		{volumesFrom: "123456789:", expectID: "123456789", expectMode: "", err: false, expectErr: nil},
-		{volumesFrom: "", expectID: "", expectMode: "", err: true, expectErr: fmt.Errorf("invalid argument volumes-from")},
-		{volumesFrom: ":", expectID: "", expectMode: "", err: true, expectErr: fmt.Errorf("failed to parse container's id")},
+		{
+			volumesFrom: "123456789",
+			expectID:    "123456789",
+			expectMode:  "",
+			err:         false,
+			expectErr:   nil,
+		},
+		{
+			volumesFrom: "123456789:nocopy",
+			expectID:    "123456789",
+			expectMode:  "nocopy",
+			err:         false,
+			expectErr:   nil,
+		},
+		{
+			volumesFrom: "123456789:",
+			expectID:    "123456789",
+			expectMode:  "",
+			err:         false,
+			expectErr:   nil,
+		},
+		{
+			volumesFrom: "",
+			expectID:    "",
+			expectMode:  "",
+			err:         true,
+			expectErr:   fmt.Errorf("invalid argument volumes-from"),
+		},
+		{
+			volumesFrom: ":",
+			expectID:    "",
+			expectMode:  "",
+			err:         true,
+			expectErr:   fmt.Errorf("failed to parse container's id"),
+		},
 	}
 
 	for _, p := range parseds {
@@ -103,5 +253,38 @@ func TestParseVolumesFrom(t *testing.T) {
 			assert.Equal(p.expectID, containerID)
 			assert.Equal(p.expectMode, mode)
 		}
+	}
+}
+
+func TestCheckDuplicateMountPoint(t *testing.T) {
+	assert := assert.New(t)
+
+	type parsed struct {
+		mounts      []*types.MountPoint
+		destination string
+		expectBool  bool
+	}
+
+	parseds := []parsed{
+		{
+			[]*types.MountPoint{
+				{Destination: "/mnt/a"},
+				{Destination: "/mnt/b"},
+			},
+			"/mnt/b",
+			true,
+		},
+		{
+			[]*types.MountPoint{
+				{Destination: "/mnt/c"},
+			},
+			"/mnt/b",
+			false,
+		},
+	}
+
+	for _, p := range parseds {
+		realBool := CheckDuplicateMountPoint(p.mounts, p.destination)
+		assert.Equal(realBool, p.expectBool)
 	}
 }

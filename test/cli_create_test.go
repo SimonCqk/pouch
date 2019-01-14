@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"runtime"
 	"strings"
 
 	"github.com/alibaba/pouch/apis/types"
@@ -14,7 +13,7 @@ import (
 
 	"github.com/go-check/check"
 	"github.com/gotestyourself/gotestyourself/icmd"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 )
 
 // PouchCreateSuite is the test suite for create CLI.
@@ -47,10 +46,9 @@ func (suite *PouchCreateSuite) TestCreateName(c *check.C) {
 	// create command should add newline at the end of result
 	digStr := strings.TrimSpace(res.Combined())
 	c.Assert(res.Combined(), check.Equals, fmt.Sprintf("%s\n", digStr))
-
 }
 
-// TestCreateNameByImageID is to verify the correctness of creating contaier with specified name by image id.
+// TestCreateNameByImageID is to verify the correctness of creating container with specified name by image id.
 func (suite *PouchCreateSuite) TestCreateNameByImageID(c *check.C) {
 	name := "create-normal-by-image-id"
 
@@ -110,12 +108,7 @@ func (suite *PouchCreateSuite) TestCreateWithTTY(c *check.C) {
 //
 // TODO: pouch inspect should return volume info to check
 func (suite *PouchCreateSuite) TestPouchCreateVolume(c *check.C) {
-	pc, _, _, _ := runtime.Caller(0)
-	tmpname := strings.Split(runtime.FuncForPC(pc).Name(), ".")
-	var funcname string
-	for i := range tmpname {
-		funcname = tmpname[i]
-	}
+	funcname := "TestPouchCreateVolume"
 
 	res := command.PouchRun("create", "-v /tmp:/tmp", "--name", funcname, busyboxImage)
 	defer DelContainerForceMultyTime(c, funcname)
@@ -285,13 +278,9 @@ func (suite *PouchCreateSuite) TestCreateWithPrivilege(c *check.C) {
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
 
-	output := command.PouchRun("inspect", name).Stdout()
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].HostConfig.Privileged, check.Equals, true)
+	privileged, err := inspectFilter(name, ".HostConfig.Privileged")
+	c.Assert(err, check.IsNil)
+	c.Assert(privileged, check.Equals, "true")
 }
 
 // TestCreateEnableLxcfs tries to test create a container with lxcfs.
@@ -302,17 +291,9 @@ func (suite *PouchCreateSuite) TestCreateEnableLxcfs(c *check.C) {
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
 
-	output := command.PouchRun("inspect", name).Stdout()
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].HostConfig.EnableLxcfs, check.NotNil)
-
-	if result[0].HostConfig.EnableLxcfs != true {
-		c.Errorf("failed to set EnableLxcfs")
-	}
+	enableLxcfs, err := inspectFilter(name, ".HostConfig.EnableLxcfs")
+	c.Assert(err, check.IsNil)
+	c.Assert(enableLxcfs, check.Equals, "true")
 }
 
 // TestCreateWithEnv tests creating container with env
@@ -348,13 +329,9 @@ func (suite *PouchCreateSuite) TestCreateWithWorkDir(c *check.C) {
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
 
-	output := command.PouchRun("inspect", name).Stdout()
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(strings.TrimSpace(result[0].Config.WorkingDir), check.Equals, "/tmp/test")
+	workingDir, err := inspectFilter(name, ".Config.WorkingDir")
+	c.Assert(err, check.IsNil)
+	c.Assert(strings.TrimSpace(workingDir), check.Equals, "/tmp/test")
 
 	// TODO: check the work directory has been created.
 }
@@ -364,37 +341,25 @@ func (suite *PouchCreateSuite) TestCreateWithUser(c *check.C) {
 	name := "TestCreateWithUser"
 	user := "1001"
 
-	res := command.PouchRun("create", "--name", name, "--user", user, busyboxImage)
+	command.PouchRun("create", "--name", name, "--user", user, busyboxImage).Assert(c, icmd.Success)
 	defer DelContainerForceMultyTime(c, name)
 
-	res.Assert(c, icmd.Success)
-
-	output := command.PouchRun("inspect", name).Stdout()
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].Config.User, check.Equals, user)
+	userConfig, err := inspectFilter(name, ".Config.User")
+	c.Assert(err, check.IsNil)
+	c.Assert(userConfig, check.Equals, user)
 }
 
-// TestCreateWithIntelRdt tests creating container with Intel Rdt.
+// TestCreateWithIntelRdt tests creating container with Intel RDT.
 func (suite *PouchCreateSuite) TestCreateWithIntelRdt(c *check.C) {
 	name := "TestCreateWithIntelRdt"
 	intelRdt := "L3:<cache_id0>=<cbm0>"
 
-	res := command.PouchRun("create", "--name", name, "--intel-rdt-l3-cbm", intelRdt, busyboxImage)
+	command.PouchRun("create", "--name", name, "--intel-rdt-l3-cbm", intelRdt, busyboxImage).Assert(c, icmd.Success)
 	defer DelContainerForceMultyTime(c, name)
 
-	res.Assert(c, icmd.Success)
-
-	output := command.PouchRun("inspect", name).Stdout()
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(result[0].HostConfig.IntelRdtL3Cbm, check.Equals, intelRdt)
+	intelRdtL3Cbm, err := inspectFilter(name, ".HostConfig.IntelRdtL3Cbm")
+	c.Assert(err, check.IsNil)
+	c.Assert(intelRdtL3Cbm, check.Equals, intelRdt)
 }
 
 // TestCreateWithAliOSMemoryOptions tests creating container with AliOS container isolation options.
@@ -422,7 +387,7 @@ func (suite *PouchCreateSuite) TestCreateWithAliOSMemoryOptions(c *check.C) {
 	c.Assert(result[0].HostConfig.ScheLatSwitch, check.Equals, int64(1))
 }
 
-// TestCreateWithOOMOption tests creating container with oom options.
+// TestCreateWithOOMOption tests creating container with OOM options.
 func (suite *PouchCreateSuite) TestCreateWithOOMOption(c *check.C) {
 	name := "TestCreateWithOOMOption"
 	oomScore := "100"
@@ -487,35 +452,30 @@ func (suite *PouchCreateSuite) TestCreateWithUlimit(c *check.C) {
 }
 
 // TestCreateWithPidsLimit tests running container with --pids-limit flag.
-func (suite *PouchRunSuite) TestCreateWithPidsLimit(c *check.C) {
+func (suite *PouchCreateSuite) TestCreateWithPidsLimit(c *check.C) {
 	cname := "TestCreateWithPidsLimit"
-	res := command.PouchRun("create", "--pids-limit", "10", "--name", cname, busyboxImage)
-	res.Assert(c, icmd.Success)
+	command.PouchRun("create", "--pids-limit", "10", "--name", cname, busyboxImage).Assert(c, icmd.Success)
 
-	output := command.PouchRun("inspect", cname).Stdout()
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	pl := result[0].HostConfig.PidsLimit
-	c.Assert(int(pl), check.Equals, 10)
+	pidsLimit, err := inspectFilter(cname, ".HostConfig.PidsLimit")
+	c.Assert(err, check.IsNil)
+	c.Assert(pidsLimit, check.Equals, "10")
 }
 
 // TestCreateWithNonExistImage tests running container with image not exist.
-func (suite *PouchRunSuite) TestCreateWithNonExistImage(c *check.C) {
+func (suite *PouchCreateSuite) TestCreateWithNonExistImage(c *check.C) {
 	cname := "TestCreateWithNonExistImage"
 	// we should use a non-used image, since containerd not remove image immediately.
-	image := "docker.io/library/alpine"
-	res := command.PouchRun("create", "--name", cname, image)
-	res.Assert(c, icmd.Success)
+	DelImageForceOk(c, busyboxImage)
+	command.PouchRun("create", "--name", cname, busyboxImage).Assert(c, icmd.Success)
 }
 
 // TestCreateWithNonExistImage tests running container with image not exist.
-func (suite *PouchRunSuite) TestCreateWithNvidiaConfig(c *check.C) {
+func (suite *PouchCreateSuite) TestCreateWithNvidiaConfig(c *check.C) {
 	cname := "TestCreateWithNvidiaConfig"
-	image := "docker.io/library/alpine"
-	res := command.PouchRun("create", "--name", cname, "--nvidia-capabilities", "all", "--nvidia-visible-devs", "none", image)
-	res.Assert(c, icmd.Success)
+	command.PouchRun("create", "--name", cname,
+		"--nvidia-capabilities", "all",
+		"--nvidia-visible-devs", "none", busyboxImage).Assert(c, icmd.Success)
+	defer command.PouchRun("rm", "-vf", cname)
 
 	output := command.PouchRun("inspect", cname).Stdout()
 	result := []types.ContainerJSON{}
@@ -529,11 +489,11 @@ func (suite *PouchRunSuite) TestCreateWithNvidiaConfig(c *check.C) {
 }
 
 // TestCreateWithNonExistImage tests running container with image not exist.
-func (suite *PouchRunSuite) TestCreateWithoutNvidiaConfig(c *check.C) {
+func (suite *PouchCreateSuite) TestCreateWithoutNvidiaConfig(c *check.C) {
 	cname := "TestCreateWithoutNvidiaConfig"
-	image := "docker.io/library/alpine"
-	res := command.PouchRun("create", "--name", cname, image)
-	res.Assert(c, icmd.Success)
+
+	command.PouchRun("create", "--name", cname, busyboxImage).Assert(c, icmd.Success)
+	defer command.PouchRun("rm", "-vf", cname)
 
 	output := command.PouchRun("inspect", cname).Stdout()
 	result := []types.ContainerJSON{}

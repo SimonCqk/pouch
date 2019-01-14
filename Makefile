@@ -27,6 +27,22 @@ DAEMON_INTEGRATION_BINARY_NAME=pouchd-integration
 # INTEGRATION_TESTCASE_BINARY_NAME is the name of binary of integration cases.
 INTEGRATION_TESTCASE_BINARY_NAME=pouchd-integration-test
 
+# GOARCH is the target platform for build
+GOARCH ?= $(shell go env GOARCH)
+GOPATH ?= $(shell go env GOPATH)
+
+# CC is the cross compiler
+ifeq (${GOARCH},arm64)
+	CC=aarch64-linux-gnu-gcc
+else ifeq (${GOARCH},ppc64le)
+	CC=powerpc64le-linux-gnu-gcc
+else
+	GOARCH=amd64
+endif
+
+# BUILD_ROOT is specified
+BUILD_ROOT := ${CURDIR}/install/${GOARCH}
+
 # DEST_DIR is base path used to install pouch & pouchd
 DEST_DIR=/usr/local
 
@@ -43,7 +59,7 @@ endif
 API_VERSION="1.24"
 
 # VERSION is used for daemon Release Version in go build.
-VERSION ?= "1.0.0"
+VERSION ?= "1.1.0"
 
 # GIT_COMMIT is used for daemon GitCommit in go build.
 GIT_COMMIT=$(shell git describe --dirty --always --tags 2> /dev/null || true)
@@ -57,37 +73,142 @@ DEFAULT_LDFLAGS="-X ${VERSION_PKG}/version.GitCommit=${GIT_COMMIT} \
 		  -X ${VERSION_PKG}/version.ApiVersion=${API_VERSION} \
 		  -X ${VERSION_PKG}/version.BuildTime=${BUILD_TIME}"
 
+GOBUILD_TAGS=$(if $(BUILDTAGS),-tags "$(BUILDTAGS)",)
+
 # COVERAGE_PACKAGES is the coverage we care about.
 COVERAGE_PACKAGES=$(shell go list ./... | \
 				  grep -v github.com/alibaba/pouch$$ | \
 				  grep -v github.com/alibaba/pouch/storage/volume/examples/demo | \
 				  grep -v github.com/alibaba/pouch/test | \
-				  grep -v github.com/alibaba/pouch/cli | \
+				  grep -v github.com/alibaba/pouch/cli$$ | \
+				  grep -v github.com/alibaba/pouch/cli/ | \
 				  grep -v github.com/alibaba/pouch/cri/apis | \
 				  grep -v github.com/alibaba/pouch/apis/types )
 
 COVERAGE_PACKAGES_LIST=$(shell echo $(COVERAGE_PACKAGES) | tr " " ",")
 
+#  POUCH IMAGE is the develop image for cross-building
+GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
+GIT_BRANCH_CLEAN := $(shell echo $(GIT_BRANCH) | sed -e "s/[^[:alnum:]]/-/g")
+POUCH_IMAGE := pouch_dev$(if $(GIT_BRANCH_CLEAN),:$(GIT_BRANCH_CLEAN))
+
+# Project location
+RUNC_PRO := github.com/opencontainers/runc
+CONTAINERD_PRO := github.com/containerd/containerd
+POUCH_PRO := github.com/alibaba/pouch
+LXCFS_PRO := github.com/lxc/lxcfs
+
+# Runc cross building configuration
+RUNC_VERSION ?= "v1.0.0-rc6-1"
+RUNC_BUILDTAGS := seccomp
+RUNC_EXTRA_FLAGS :=
+RUNC_COMMIT_NO :=
+RUNC_COMMIT :=
+
+# CONTAINERD cross-building configuration
+CONTAINERD_VERSION := "v1.0.3"
+
+# LXCFS cross building configuration
+LXCFS_VERSION := "stable-2.0"
+
 build: build-daemon build-cli ## build PouchContainer both daemon and cli binaries
 
-build-daemon: modules ## build PouchContainer daemon binary
+build-daemon: modules plugin ## build PouchContainer daemon binary
 	@echo "$@: bin/${DAEMON_BINARY_NAME}"
 	@mkdir -p bin
-	@GOOS=linux go build -ldflags ${DEFAULT_LDFLAGS} -o bin/${DAEMON_BINARY_NAME} -tags 'selinux'
+	@GOOS=linux go build -ldflags ${DEFAULT_LDFLAGS} ${GOBUILD_TAGS} -o bin/${DAEMON_BINARY_NAME}
 
 build-cli: ## build PouchContainer cli binary
 	@echo "$@: bin/${CLI_BINARY_NAME}"
 	@mkdir -p bin
 	@go build -o bin/${CLI_BINARY_NAME} github.com/alibaba/pouch/cli
 
-build-daemon-integration: modules ## build PouchContainer daemon integration testing binary
+dev-image: ## build the Docker Image as cross building environment
+	docker build -f Dockerfile.${GOARCH}.cross . -t ${POUCH_IMAGE}
+
+shell: dev-image ## enter into the cross building shell environment
+	docker run -ti --privileged --rm -v ${CURDIR}:/go/src/${POUCH_PRO} \
+		${POUCH_IMAGE} \
+		bash
+
+download-source: ## download source code for cross-building
+	@echo "remove the source code"
+	rm -rf ${GOPATH}/src/${RUNC_PRO}
+	rm -rf ${GOPATH}/src/${CONTAINERD_PRO}
+	rm -rf ${GOPATH}/src/${LXCFS_PRO}
+	mkdir -p ${GOPATH}/src/${RUNC_PRO}
+	mkdir -p ${GOPATH}/src/${CONTAINERD_PRO}
+	mkdir -p ${GOPATH}/src/${LXCFS_PRO}
+	@echo "download the runc source code"
+	git clone -b ${RUNC_VERSION} \
+		https://github.com/alibaba/runc \
+		${GOPATH}/src/${RUNC_PRO}
+	@echo "download the containerd source code"
+	git clone -b ${CONTAINERD_VERSION} \
+		https://${CONTAINERD_PRO} \
+		${GOPATH}/src/${CONTAINERD_PRO}
+	@echo "download the containerd source code"
+	git clone -b ${LXCFS_VERSION} \
+		https://${LXCFS_PRO} \
+		${GOPATH}/src/${LXCFS_PRO}
+
+cross-build: dev-image ## cross build pouchd pouchd runc containerd on host
+	docker run -e BUILDTAGS="$(BUILDTAGS)" -e GOARCH="${GOARCH}" \
+		--rm -v ${CURDIR}:/go/src/${POUCH_PRO} \
+		${POUCH_IMAGE} \
+		make local-cross
+
+local-cross: modules plugin download-source ## local cross build pouch pouchd runc containerd inside container
+	@echo "$@: ${BUILD_ROOT}/bin/${DAEMON_BINARY_NAME}"
+	@mkdir -p ${BUILD_ROOT}/bin
+	@CGO_ENABLED=1 GOARCH=${GOARCH} GOOS=linux CC=${CC} \
+		go build -ldflags ${DEFAULT_LDFLAGS} ${GOBUILD_TAGS} \
+		-o ${BUILD_ROOT}/bin/${DAEMON_BINARY_NAME}
+	@echo "$@: ${BUILD_ROOT}/bin/${CLI_BINARY_NAME}"
+	@CGO_ENABLED=0 GOARCH=${GOARCH} \
+		go build -o ${BUILD_ROOT}/bin/${CLI_BINARY_NAME} \
+		github.com/alibaba/pouch/cli
+	@echo "$@: ${BUILD_ROOT}/bin/runc"
+	@CGO_ENABLED=1 GOARCH=${GOARCH} GOOS=linux CC=${CC} \
+		go build -buildmode=pie ${RUNC_EXTRA_FLAGS} \
+		-ldflags "-X main.gitCommit=${RUNC_COMMIT} -X main.version=${RUNC_VERSION} ${RUNC_EXTRA_LDFLAGS}" \
+		-tags "${RUNC_BUILDTAGS}" \
+		-o ${BUILD_ROOT}/bin/runc ${RUNC_PRO}
+	@CGO_ENABLED=1 GOARCH=${GOARCH} GOOS=linux CC=${CC} \
+		${MAKE} -C /go/src/${CONTAINERD_PRO} && cp -Rf /go/src/${CONTAINERD_PRO}/bin/* ${BUILD_ROOT}/bin
+	@echo "cross building lxcfs"
+	cd /go/src/${LXCFS_PRO} \
+		&& grep -l -r "liblxcfs" . | xargs sed -i 's/liblxcfs/libpouchlxcfs/g' \
+		&& ./bootstrap.sh
+ifeq (${GOARCH},amd64)
+	cd /go/src/${LXCFS_PRO} \
+		&& ./configure --prefix=${BUILD_ROOT}
+endif
+ifeq (${GOARCH},arm64)
+	cd /go/src/${LXCFS_PRO} \
+		&& ./configure --prefix=${BUILD_ROOT} \
+		--host=aarch64-linux-gnu \
+		--with-gnu-ld \
+		--with-distro=redhat
+endif
+ifeq (${GOARCH},ppc64le)
+	cd /go/src/${LXCFS_PRO} \
+		&& ./configure --prefix=${BUILD_ROOT} \
+		--host=powerpc64le-linux-gnu \
+		--with-gnu-ld \
+		--with-distro=redhat
+endif
+	@cd /go/src/${LXCFS_PRO} && ${MAKE} clean && ${MAKE} && ${MAKE} install
+	@mv ${BUILD_ROOT}/bin/lxcfs ${BUILD_ROOT}/bin/pouch-lxcfs
+
+build-daemon-integration: modules plugin ## build PouchContainer daemon integration testing binary
 	@echo $@
 	@mkdir -p bin
-	go test -c ${TEST_FLAGS} \
+	go test -c ${TEST_FLAGS} ${GOBUILD_TAGS} \
 		-cover -covermode=atomic -coverpkg ${COVERAGE_PACKAGES_LIST} \
 		-o bin/${DAEMON_INTEGRATION_BINARY_NAME}
 
-build-integration-test: modules ## build PouchContainer integration test-case binary
+build-integration-test: modules plugin ## build PouchContainer integration test-case binary
 	@echo $@
 	@mkdir -p bin
 	go test -c \
@@ -130,6 +251,7 @@ download-dependencies: package-dependencies ## install dumb-init, local-persist,
 clean: ## clean to remove bin/* and files created by module
 	@go clean
 	@rm -f bin/*
+	@rm -rf install/*
 	@rm -rf coverage/*
 	@./hack/module --clean
 
@@ -150,7 +272,7 @@ gometalinter: ## run gometalinter for go source code
 
 
 .PHONY: unit-test
-unit-test: modules ## run go unit-test
+unit-test: modules plugin ## run go unit-test
 	@echo $@
 	@mkdir -p coverage
 	@( for pkg in ${COVERAGE_PACKAGES}; do \
@@ -161,7 +283,7 @@ unit-test: modules ## run go unit-test
 	done )
 
 .PHONY: integration-test
-integration-test: ## run daemon integration-test
+integration-test: build-daemon-integration build-integration-test ## run daemon integration-test
 	@echo $@
 	@mkdir -p coverage
 	./hack/testing/run_daemon_integration.sh
@@ -192,6 +314,15 @@ coverage: ## combine coverage after test
 	@echo $@
 	@gocovmerge coverage/* > coverage.txt
 
+.PHONY: plugin
+plugin: ## build hook plugin
+	@echo "build $@"
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/containerplugin
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/daemonplugin
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/criplugin
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/volumeplugin
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/apiplugin
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/imageplugin
 
 .PHONY: help
 help: ## this help

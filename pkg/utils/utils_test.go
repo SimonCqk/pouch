@@ -535,6 +535,8 @@ func TestStringSliceEqual(t *testing.T) {
 		{[]string{"a"}, []string{"a"}, true},
 		{[]string{"a"}, []string{"b", "a"}, false},
 		{[]string{"a", "b"}, []string{"b", "a"}, true},
+		{[]string{"a", "b", "b"}, []string{"b", "a", "a"}, false},
+		{[]string{"a", "b", "b", "c"}, []string{"b", "a", "b", "c"}, true},
 	}
 
 	for _, test := range tests {
@@ -574,5 +576,239 @@ func TestMergeMap(t *testing.T) {
 				t.Fatalf("MergeMap(%v, %v) expected: %v, but got %v", test.m1, test.m2, test.expect.value, m3[test.expect.key])
 			}
 		}
+	}
+}
+
+func TestToStringMap(t *testing.T) {
+	type Expect struct {
+		isNil bool
+		key   string
+		value string
+	}
+	tests := []struct {
+		m1     map[string]interface{}
+		expect Expect
+	}{
+		{nil, Expect{true, "", ""}},
+		{map[string]interface{}{"a": "a", "b": "b"}, Expect{false, "a", "a"}},
+		{map[string]interface{}{"a": "a", "b": "b"}, Expect{false, "b", "b"}},
+		{map[string]interface{}{"a": map[string]string{"aa": "aa"}, "b": "b"}, Expect{false, "a", ""}},
+		{map[string]interface{}{"a": map[string]string{"aa": "aa"}, "b": "b"}, Expect{false, "b", "b"}},
+	}
+
+	for _, test := range tests {
+		m2 := ToStringMap(test.m1)
+		if (test.expect.isNil && m2 != nil) || (!test.expect.isNil && m2 == nil) {
+			t.Fatalf("ToStringMap(%v) expected: %v, but got %v", test.m1, test.expect, m2)
+		}
+		if m2[test.expect.key] != test.expect.value {
+			t.Fatalf("ToStringMap(%v) expected: %v, but got %v", test.m1, test.expect.value, m2[test.expect.key])
+		}
+	}
+}
+
+func TestStringSliceDelete(t *testing.T) {
+	type Expect struct {
+		index int
+		value string
+	}
+	tests := []struct {
+		s1     []string
+		del    string
+		expect *Expect
+	}{
+		{nil, "", nil},
+		{[]string{"a", "b", "a"}, "a", &Expect{0, "b"}},
+		{[]string{"a", "b", "a"}, "b", &Expect{0, "a"}},
+		{[]string{"a", "b", "a", "c"}, "a", &Expect{1, "c"}},
+	}
+
+	for _, test := range tests {
+		s2 := StringSliceDelete(test.s1, test.del)
+		if test.expect == nil && s2 != nil {
+			t.Fatalf("StringSliceDelete(%v) expected: nil, but got %v", test.s1, s2)
+		}
+
+		if s2 != nil && s2[test.expect.index] != test.expect.value {
+			t.Fatalf("StringSliceDelete(%v) expected: %v, but got %v", test.s1, test.expect.value, s2[test.expect.index])
+		}
+	}
+}
+
+func TestResolveHomeDir(t *testing.T) {
+	assert := assert.New(t)
+	type tCase struct {
+		ErrorLine error
+		pass      bool
+		path      string
+		realPath  string
+	}
+
+	dir, err := ioutil.TempDir("", "TestResolveHomeDir")
+	assert.NoError(err)
+	defer os.RemoveAll(dir)
+	fileMode := os.FileMode(0666)
+
+	pa := filepath.Join(dir, "IAmDir")
+	assert.NoError(os.Mkdir(pa, fileMode))
+
+	pb := filepath.Join(dir, "IAmFile")
+	f, err := os.Create(pb)
+	assert.NoError(err)
+	f.Close()
+
+	target := filepath.Join(dir, "target")
+	assert.NoError(os.Mkdir(target, fileMode))
+	link := filepath.Join(dir, "link")
+	assert.NoError(os.Symlink(target, link))
+
+	for _, t := range []tCase{
+		{
+			ErrorLine: nil,
+			pass:      true,
+			path:      filepath.Join(dir, "non-exist"),
+			realPath:  filepath.Join(dir, "non-exist"),
+		},
+		{
+			ErrorLine: nil,
+			pass:      true,
+			path:      pa,
+			realPath:  pa,
+		},
+		{
+			ErrorLine: nil,
+			pass:      true,
+			path:      link,
+			realPath:  target,
+		},
+		{
+			ErrorLine: fmt.Errorf("home dir should not be empty"),
+			pass:      false,
+			path:      "",
+		},
+		{
+			ErrorLine: fmt.Errorf("home dir %s should be directory", pb),
+			pass:      false,
+			path:      pb,
+		},
+		{
+			ErrorLine: fmt.Errorf("home dir %s should be an absolute path", "relative-directory"),
+			pass:      false,
+			path:      "relative-directory",
+		},
+	} {
+		p, err := ResolveHomeDir(t.path)
+		if t.pass {
+			assert.NoError(err)
+			assert.Equal(p, t.realPath)
+		} else {
+			assert.Equal(t.ErrorLine, err)
+		}
+	}
+}
+
+func TestMatchLabelSelector(t *testing.T) {
+	type args struct {
+		selector map[string]string
+		labels   map[string]string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "Normal Test",
+			args: args{
+				selector: map[string]string{
+					"a1": "b1",
+					"a2": "b2",
+				},
+				labels: map[string]string{
+					"a1": "b1",
+					"a2": "b2",
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Uncovered Test",
+			args: args{
+				selector: map[string]string{
+					"a1": "b1",
+					"a2": "b2",
+				},
+				labels: map[string]string{
+					"a2": "b2",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Unmatched Test",
+			args: args{
+				selector: map[string]string{
+					"a1": "b0",
+					"a2": "b2",
+				},
+				labels: map[string]string{
+					"a1": "b1",
+					"a2": "b2",
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := MatchLabelSelector(tt.args.selector, tt.args.labels); got != tt.want {
+				t.Errorf("matchLabelSelector() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractIPAndPortFromAddresses(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantIP   string
+		wantPort string
+	}{
+		{
+			name:     "listening addresses are nil",
+			args:     nil,
+			wantIP:   "",
+			wantPort: "",
+		},
+		{
+			name:     "listening addresses have no tcp address",
+			args:     []string{"unix:///var/run/pouchd.sock"},
+			wantIP:   "",
+			wantPort: "",
+		},
+		{
+			name:     "listening addresses have valid address",
+			args:     []string{"unix:///var/run/pouchd.sock", "tcp://0.0.0.0:4345"},
+			wantIP:   "0.0.0.0",
+			wantPort: "4345",
+		},
+		{
+			name:     "listening addresses have two tcp addresses",
+			args:     []string{"tcp://10.10.10.10:1234", "tcp://0.0.0.0:4345"},
+			wantIP:   "10.10.10.10",
+			wantPort: "1234",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotIP, gotPort := ExtractIPAndPortFromAddresses(tt.args)
+			if gotIP != tt.wantIP {
+				t.Errorf("extractIPAndPortFromAddresses() IP = %v, want IP %v", gotIP, tt.wantIP)
+			}
+			if gotPort != tt.wantPort {
+				t.Errorf("extractIPAndPortFromAddresses() Port = %v, want Port %v", gotPort, tt.wantPort)
+			}
+		})
 	}
 }
